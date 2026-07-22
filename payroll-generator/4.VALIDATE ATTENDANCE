@@ -1,0 +1,585 @@
+/*******************************************************
+ * VALIDATE ATTENDANCE — precheck gate for Get Payroll Data
+ *
+ * Updated flow (as requested):
+ * 1) Find matching month attendance file
+ * 2) Check Salary Advance deductions -> Payroll Status == LOCKED ? -> STOP (no META write)
+ * 3) Check Attendance entry -> LOCKED STATUS contains "LOCKED" ? -> if NOT, STOP (no META write)
+ * 4) If (2) not locked AND (3) locked:
+ *    ✅ Immediately write ONLY these 2 keys in Payroll META_DATA:
+ *       - PAYROLL_MONTH_LABEL
+ *       - ATTENDANCE_FILE_ID (CLICKABLE LINK)
+ *    Then continue remaining validations.
+ *
+ * On later validation failure:
+ *  - Show UI alert and stop
+ *  - (PAYROLL_MONTH_LABEL + ATTENDANCE_FILE_ID remain, so you can click and visit attendance)
+ *
+ * On full success:
+ *  - Additionally write:
+ *    - ATTENDANCE_LAST_UPDATED  ← written as plain text to prevent Sheets date formatting
+ *    - ATTENDANCE_VALIDATION
+ *
+ * NUMERIC SANITY (updated):
+ * - TOTAL PRESENT DAYS can be 0 (must be not blank + numeric)
+ * - Keep:
+ *   - TOTAL WORKING DAYS > 0
+ *   - 0 <= TOTAL PRESENT DAYS <= TOTAL WORKING DAYS
+ *   - 0 <= FINAL PAYABLE DAYS <= TOTAL WORKING DAYS
+ *   - 0 <= LOP DAYS
+ * - Do NOT enforce FINAL PAYABLE DAYS <= TOTAL PRESENT DAYS
+ *
+ * USER GATE:
+ * ✅ pmo@butlerleather.com        → runs directly
+ * ✅ hrassist@butlerleather.com   → runs via Web App (as owner)
+ * ✅ Others                       → blocked
+ *******************************************************/
+
+const VA_OWNER_EMAIL   = 'pmo@butlerleather.com';
+const VA_ALLOWED_EMAIL = 'hrassist@butlerleather.com';
+
+function validateAttendance() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    // ── Owner: run directly ──
+    if (currentUser === VA_OWNER_EMAIL.toLowerCase()) {
+      validateAttendanceServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      return;
+    }
+
+    // ── Allowed user: call Web App (runs as owner) ──
+    if (currentUser === VA_ALLOWED_EMAIL.toLowerCase()) {
+      if (!GLP_WEBAPP_URL || GLP_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert(
+          'Validate Attendance',
+          'Web App URL is not configured. Please deploy the Web App and paste the URL in GLP_WEBAPP_URL.',
+          ui.ButtonSet.OK
+        );
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(GLP_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'validateAttendance',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      if (result.message) {
+        ui.alert('Validate Attendance', result.message, ui.ButtonSet.OK);
+      }
+      return;
+    }
+
+    // ── Anyone else: blocked ──
+    ui.alert(
+      'Validate Attendance',
+      'You are not authorized to run this function.',
+      ui.ButtonSet.OK
+    );
+
+  } catch (err) {
+    ui.alert(
+      'Validate Attendance',
+      `Error: ${err && err.message ? err.message : err}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function validateAttendanceServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  const runMode       = String(payload.runMode || 'webapp').trim();
+
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+
+  let ui = null;
+  if (runMode === 'direct') {
+    try { ui = SpreadsheetApp.getUi(); } catch (_) { ui = null; }
+  }
+
+  const alert_ = (title, msg) => {
+    if (ui) ui.alert(title, msg, ui.ButtonSet.OK);
+    return { success: false, message: msg };
+  };
+
+  try {
+    // ---- 0) Guards ----
+    const meta = ss.getSheetByName('META_DATA');
+    if (!meta) throw new Error('Missing required tab: META_DATA');
+
+    const fileName  = ss.getName();
+    const monthInfo = parsePayrollMonthFromName_(fileName);
+    if (!monthInfo) {
+      return alert_(
+        'Validate Attendance',
+        `Cannot parse payroll month from file name: "${fileName}".\nExpected like "Payroll-Workings_January_2026".`
+      );
+    }
+    const { monthLabel } = monthInfo;
+
+    const attendanceFolderId = CONST?.FOLDERS?.MONTHLY_ATTENDANCE;
+    if (!attendanceFolderId) throw new Error('Missing CONST.FOLDERS.MONTHLY_ATTENDANCE');
+
+    // ---- 1) Find attendance file (EXACT match only) ----
+    const attendanceFile = findAttendanceFileForMonth_(attendanceFolderId, monthLabel);
+    if (!attendanceFile) {
+      return alert_(
+        'Validate Attendance',
+        `Attendance file not found for month "${monthLabel}".\nExpected name exactly like "Attendance_${monthLabel}".`
+      );
+    }
+
+    const attendanceFileId = attendanceFile.getId();
+    const attendanceUrl    = `https://docs.google.com/spreadsheets/d/${attendanceFileId}`;
+    const attSS            = SpreadsheetApp.openById(attendanceFileId);
+
+    // ---- 2) Required tabs exist (early gate tabs) ----
+    if (!attSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS)) {
+      return alert_('Validate Attendance', `Missing required tab in attendance file: "${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS}"`);
+    }
+    if (!attSS.getSheetByName(CONST.TABS.ATTENDANCE_ENTRY)) {
+      return alert_('Validate Attendance', `Missing required tab in attendance file: "${CONST.TABS.ATTENDANCE_ENTRY}"`);
+    }
+
+    // ---- 3) EARLY GATE #1: Salary Advance deductions -> Payroll Status LOCKED? ----
+    {
+      const sa   = validateReadSheet_(attSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS));
+      const miss = validateHeaders_(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS, sa.headers, ['Employee Code', 'Payroll Status']);
+      if (miss) return alert_('Validate Attendance', miss);
+
+      const idx = sa.hIdx;
+      const cPS = idx.get(norm_('Payroll Status'));
+
+      for (const r of sa.data) {
+        const ps = String(r[cPS] || '').trim().toUpperCase();
+        if (ps === 'LOCKED') {
+          return alert_('Validate Attendance', 'Payroll already locked.');
+        }
+      }
+    }
+
+    // ---- 4) EARLY GATE #2: Attendance entry -> LOCKED STATUS contains LOCKED? ----
+    {
+      const entryGate = validateReadSheet_(attSS.getSheetByName(CONST.TABS.ATTENDANCE_ENTRY));
+      const miss      = validateHeaders_(CONST.TABS.ATTENDANCE_ENTRY, entryGate.headers, ['Employee Code', 'LOCKED STATUS']);
+      if (miss) return alert_('Validate Attendance', miss);
+
+      const idx     = entryGate.hIdx;
+      const cLocked = idx.get(norm_('LOCKED STATUS'));
+
+      const anyLocked = entryGate.data.some((r) => String(r[cLocked] || '').toUpperCase().includes('LOCKED'));
+      if (!anyLocked) {
+        return alert_('Validate Attendance', 'Lock the attendance then run the payroll.');
+      }
+    }
+
+    // ---- 5) Write first 2 META keys immediately ----
+    setMetaValue_(meta, 'PAYROLL_MONTH_LABEL', monthLabel);
+    setMetaValue_(meta, 'ATTENDANCE_FILE_ID', attendanceUrl);
+
+    // ---- 6) Remaining required tabs exist ----
+    const requiredTabs = [
+      CONST.TABS.ATTENDANCE_ENTRY,
+      CONST.TABS.LATE_ENTRY,
+      CONST.TABS.OT_ENTRY,
+      CONST.TABS.CARRY_FORWARDED,
+      CONST.TABS.OTHER_PAYMENTS,
+      CONST.TABS.OTHER_DEDUCTIONS,
+      CONST.TABS.SALARY_ADVANCE_DEDUCTIONS,
+    ];
+    for (const tabName of requiredTabs) {
+      if (!attSS.getSheetByName(tabName)) {
+        return alert_('Validate Attendance', `Missing required tab in attendance file: "${tabName}"`);
+      }
+    }
+
+    // ---- 7) Attendance entry: full required headers + roster checks ----
+    const entry     = validateReadSheet_(attSS.getSheetByName(CONST.TABS.ATTENDANCE_ENTRY));
+    const missEntry = validateHeaders_(CONST.TABS.ATTENDANCE_ENTRY, entry.headers, [
+      'S.No', 'Employee Code', 'Name', 'Gender', 'Category', 'DOJ',
+      'Department', 'Designation', 'TOTAL WORKING DAYS', 'TOTAL PRESENT DAYS',
+      'LOP DAYS', 'FINAL PAYABLE DAYS', 'LOCKED STATUS',
+    ]);
+    if (missEntry) return alert_('Validate Attendance', missEntry);
+
+    const entryIdx  = entry.hIdx;
+    const cEmp      = entryIdx.get(norm_('Employee Code'));
+    const cSno      = entryIdx.get(norm_('S.NO'));
+    const cName     = entryIdx.get(norm_('NAME'));
+    const cGender   = entryIdx.get(norm_('GENDER'));
+    const cCategory = entryIdx.get(norm_('CATEGORY'));
+    const cDoj      = entryIdx.get(norm_('DOJ'));
+    const cDept     = entryIdx.get(norm_('DEPARTMENT'));
+    const cDesg     = entryIdx.get(norm_('DESIGNATION'));
+    const cTwd      = entryIdx.get(norm_('TOTAL WORKING DAYS'));
+    const cTpd      = entryIdx.get(norm_('TOTAL PRESENT DAYS'));
+    const cLop      = entryIdx.get(norm_('LOP DAYS'));
+    const cFpd      = entryIdx.get(norm_('FINAL PAYABLE DAYS'));
+
+    const empCodes = [];
+    const seen     = new Set();
+
+    for (const r of entry.data) {
+      const emp = String(r[cEmp] || '').trim();
+      if (!emp) continue;
+
+      if (seen.has(emp)) {
+        return alert_('Validate Attendance', `Duplicate Employee Code found in Attendance entry: "${emp}"`);
+      }
+      seen.add(emp);
+      empCodes.push(emp);
+
+      const missing =
+        (isBlank_(r[cSno])      ? 'S.No'       : '') ||
+        (isBlank_(r[cName])     ? 'Name'        : '') ||
+        (isBlank_(r[cGender])   ? 'Gender'      : '') ||
+        (isBlank_(r[cCategory]) ? 'Category'    : '') ||
+        (isBlank_(r[cDoj])      ? 'DOJ'         : '') ||
+        (isBlank_(r[cDept])     ? 'Department'  : '') ||
+        (isBlank_(r[cDesg])     ? 'Designation' : '');
+
+      if (missing) {
+        return alert_('Validate Attendance', `Attendance entry incomplete for "${emp}": missing ${missing}`);
+      }
+
+      if (isBlankStrict_(r[cTwd])) return alert_('Validate Attendance', `TOTAL WORKING DAYS is blank for "${emp}".`);
+      if (isBlankStrict_(r[cTpd])) return alert_('Validate Attendance', `TOTAL PRESENT DAYS is blank for "${emp}".`);
+      if (isBlankStrict_(r[cLop])) return alert_('Validate Attendance', `LOP DAYS is blank for "${emp}".`);
+      if (isBlankStrict_(r[cFpd])) return alert_('Validate Attendance', `FINAL PAYABLE DAYS is blank for "${emp}".`);
+
+      const twd = toNumber_(r[cTwd]);
+      const tpd = toNumber_(r[cTpd]);
+      const lop = toNumber_(r[cLop]);
+      const fpd = toNumber_(r[cFpd]);
+
+      if (twd <= 0)  return alert_('Validate Attendance', `TOTAL WORKING DAYS must be > 0 for "${emp}".`);
+      if (tpd < 0)   return alert_('Validate Attendance', `TOTAL PRESENT DAYS cannot be negative for "${emp}".`);
+      if (lop < 0)   return alert_('Validate Attendance', `LOP DAYS cannot be negative for "${emp}".`);
+      if (tpd > twd) return alert_('Validate Attendance', `TOTAL PRESENT DAYS > TOTAL WORKING DAYS for "${emp}".`);
+      if (fpd > twd) return alert_('Validate Attendance', `FINAL PAYABLE DAYS > TOTAL WORKING DAYS for "${emp}".`);
+      if (fpd < 0)   return alert_('Validate Attendance', `FINAL PAYABLE DAYS cannot be negative for "${emp}".`);
+    }
+
+    if (!empCodes.length) {
+      return alert_('Validate Attendance', 'No employees found in Attendance entry (Employee Code blank).');
+    }
+
+    // ---- 8) Late Entry ----
+    {
+      const late = validateReadSheet_(attSS.getSheetByName(CONST.TABS.LATE_ENTRY));
+      const miss = validateHeaders_(CONST.TABS.LATE_ENTRY, late.headers, ['Employee Code', 'LATE PENALTY COUNT']);
+      if (miss) return alert_('Validate Attendance', miss);
+
+      const idx  = late.hIdx;
+      const cKey = idx.get(norm_('Employee Code'));
+      const cCnt = idx.get(norm_('LATE PENALTY COUNT'));
+
+      const lateMap = new Map();
+      for (const r of late.data) {
+        const emp = String(r[cKey] || '').trim();
+        if (!emp) continue;
+        lateMap.set(emp, r);
+      }
+
+      for (const emp of empCodes) {
+        const row = lateMap.get(emp);
+        if (!row) return alert_('Validate Attendance', `Late Entry missing row for "${emp}".`);
+        if (isBlankStrict_(row[cCnt])) return alert_('Validate Attendance', `Late Entry: LATE PENALTY COUNT is blank for "${emp}".`);
+      }
+    }
+
+    // ---- 9) OT Entry ----
+    {
+      const ot   = validateReadSheet_(attSS.getSheetByName(CONST.TABS.OT_ENTRY));
+      const miss = validateHeaders_(CONST.TABS.OT_ENTRY, ot.headers, ['Employee Code']);
+      if (miss) return alert_('Validate Attendance', miss);
+      const err = validateNoPartialRows_(CONST.TABS.OT_ENTRY, ot.headers, ot.data, 'Employee Code', ['Remarks']);
+      if (err)  return alert_('Validate Attendance', err);
+    }
+
+    // ---- 10) Carry Forwarded ----
+    {
+      const cf   = validateReadSheet_(attSS.getSheetByName(CONST.TABS.CARRY_FORWARDED));
+      const miss = validateHeaders_(CONST.TABS.CARRY_FORWARDED, cf.headers, ['Employee Code']);
+      if (miss) return alert_('Validate Attendance', miss);
+      const err = validateAllFilledExcept_(CONST.TABS.CARRY_FORWARDED, cf.headers, cf.data, 'Employee Code', ['Remarks']);
+      if (err)  return alert_('Validate Attendance', err);
+    }
+
+    // ---- 11) Other Payments ----
+    {
+      const op   = validateReadSheet_(attSS.getSheetByName(CONST.TABS.OTHER_PAYMENTS));
+      const miss = validateHeaders_(CONST.TABS.OTHER_PAYMENTS, op.headers, ['Employee Code', 'Amount', 'Consider Under']);
+      if (miss) return alert_('Validate Attendance', miss);
+
+      const err = validateAllFilledExcept_(CONST.TABS.OTHER_PAYMENTS, op.headers, op.data, 'Employee Code', ['Remarks']);
+      if (err)  return alert_('Validate Attendance', err);
+
+      const idx  = op.hIdx;
+      const cKey = idx.get(norm_('Employee Code'));
+      const cCU  = idx.get(norm_('Consider Under'));
+      for (const r of op.data) {
+        const emp = String(r[cKey] || '').trim();
+        if (!emp) continue;
+        const cu = String(r[cCU] || '').trim().toUpperCase();
+        if (cu !== 'GROSS' && cu !== 'NET') {
+          return alert_('Validate Attendance', `Other Payments: invalid Consider Under "${cu}" for "${emp}".`);
+        }
+      }
+    }
+
+    // ---- 12) Other Deductions ----
+    {
+      const od   = validateReadSheet_(attSS.getSheetByName(CONST.TABS.OTHER_DEDUCTIONS));
+      const miss = validateHeaders_(CONST.TABS.OTHER_DEDUCTIONS, od.headers, ['Employee Code', 'Amount']);
+      if (miss) return alert_('Validate Attendance', miss);
+      const err = validateAllFilledExcept_(CONST.TABS.OTHER_DEDUCTIONS, od.headers, od.data, 'Employee Code', ['Remarks']);
+      if (err)  return alert_('Validate Attendance', err);
+    }
+
+    // ---- 13) Salary Advance deductions ----
+    {
+      const sa   = validateReadSheet_(attSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS));
+      const miss = validateHeaders_(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS, sa.headers, [
+        'Month', 'Employee Code', 'Name', 'Department',
+        'EMI Reference Number', 'EMI Amount', 'Current Balance', 'Payroll Status',
+      ]);
+      if (miss) return alert_('Validate Attendance', miss);
+
+      const idx         = sa.hIdx;
+      const cKey        = idx.get(norm_('Employee Code'));
+      const cMonth      = idx.get(norm_('Month'));
+      const required    = ['Month', 'Employee Code', 'Name', 'Department', 'EMI Reference Number', 'EMI Amount', 'Current Balance'];
+      const requiredIdx = required.map((h) => idx.get(norm_(h)));
+
+      // SA Run Timestamp must not be blank in row 2
+      const cTs = idx.get(norm_('SA Run Timestamp'));
+      if (cTs == null) {
+        return alert_(
+          'Validate Attendance',
+          'Salary Advance deductions: "SA Run Timestamp" column not found. Please run Get/Refresh Salary Advance EMI first.'
+        );
+      }
+      const saSheet   = attSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+      const tsVal     = String(saSheet.getRange(2, cTs + 1).getValue() || '').trim();
+      if (!tsVal) {
+        return alert_(
+          'Validate Attendance',
+          'Salary Advance EMI not loaded. Please run Get/Refresh Salary Advance EMI first.'
+        );
+      }
+
+      for (const r of sa.data) {
+        const emp    = String(r[cKey] || '').trim();
+        const anyReq = requiredIdx.some((c) => !isBlank_(r[c]));
+        if (!emp && !anyReq) continue;
+
+        const mVal = String(r[cMonth] || '').trim();
+        if (mVal && norm_(mVal) !== norm_(monthLabel)) {
+          return alert_(
+            'Validate Attendance',
+            `Salary Advance deductions: Month mismatch for "${emp || '(blank code)'}". Found "${mVal}", expected "${monthLabel}".`
+          );
+        }
+
+        for (let j = 0; j < requiredIdx.length; j++) {
+          if (isBlankStrict_(r[requiredIdx[j]])) {
+            return alert_(
+              'Validate Attendance',
+              `Salary Advance deductions: incomplete row for "${emp || '(blank code)'}" — missing "${required[j]}".`
+            );
+          }
+        }
+      }
+    }
+
+    // ---- 14) FULL SUCCESS: write remaining META keys ----
+    // ATTENDANCE_LAST_UPDATED is re-fetched HERE (after all reads are complete) so
+    // that any Drive timestamp bump caused by SpreadsheetApp.openById() reads above
+    // is already settled. This prevents a false "file changed" mismatch in Get Payroll Data.
+    // It is also written as plain text (format @STRING@) to prevent Google Sheets from
+    // interpreting it as a DateTime and stripping the leading zero from the hour
+    // (e.g. rendering "09:53:06" as "9:53:06").
+    const attendanceLastUpdated = DriveApp.getFileById(attendanceFileId).getLastUpdated();
+    const lastUpdatedStr = Utilities.formatDate(
+      attendanceLastUpdated,
+      Session.getScriptTimeZone(),
+      'yyyy-MM-dd HH:mm:ss'
+    );
+    setMetaValueAsText_(meta, 'ATTENDANCE_LAST_UPDATED', lastUpdatedStr);
+
+    setMetaValue_(
+      meta,
+      'ATTENDANCE_VALIDATION',
+      `VALIDATED - ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss')}`
+    );
+
+    SpreadsheetApp.flush();
+
+    const successMsg = 'Attendance validated successfully.';
+    if (ui) ss.toast(successMsg, 'Validate Attendance', 6);
+    return { success: true, message: successMsg };
+
+  } catch (err) {
+    const msg = `Error: ${err && err.message ? err.message : err}`;
+    if (ui) SpreadsheetApp.getActiveSpreadsheet().toast(String(err), 'Validate Attendance - Error', 8);
+    return { success: false, message: msg };
+  }
+}
+
+/* ==========================================================
+   REQUIRED HELPER: exact attendance file match
+   ========================================================== */
+
+function findAttendanceFileForMonth_(attendanceFolderId, monthLabel) {
+  const folder       = DriveApp.getFolderById(attendanceFolderId);
+  const expectedName = `Attendance_${monthLabel}`;
+  const it           = folder.getFilesByName(expectedName);
+  return it.hasNext() ? it.next() : null;
+}
+
+/* ===========================
+   META_DATA helpers
+=========================== */
+
+function setMetaValue_(metaSheet, key, value) {
+  const data = metaSheet.getRange(1, 1, metaSheet.getLastRow(), 2).getDisplayValues();
+  const k = norm_(key);
+  for (let i = 1; i < data.length; i++) {
+    if (norm_(data[i][0]) === k) {
+      metaSheet.getRange(i + 1, 2).setValue(value);
+      return;
+    }
+  }
+  metaSheet.appendRow([key, value]);
+}
+
+/* -----------------------------------------------------------
+   setMetaValueAsText_
+   Writes value as a plain text string (@STRING@ format) so
+   Google Sheets cannot reinterpret it as a date/time serial.
+   This ensures "09:53:06" is stored and displayed exactly as
+   written, preserving the leading zero for string comparison
+   in Get Payroll Data.
+----------------------------------------------------------- */
+function setMetaValueAsText_(metaSheet, key, value) {
+  const data = metaSheet.getRange(1, 1, metaSheet.getLastRow(), 2).getDisplayValues();
+  const k = norm_(key);
+  for (let i = 1; i < data.length; i++) {
+    if (norm_(data[i][0]) === k) {
+      const cell = metaSheet.getRange(i + 1, 2);
+      cell.setNumberFormat('@STRING@');
+      cell.setValue(value);
+      return;
+    }
+  }
+  // Key not found — append as new row (plain text in column B)
+  const newRow = metaSheet.getLastRow() + 1;
+  metaSheet.getRange(newRow, 1).setValue(key);
+  const cell = metaSheet.getRange(newRow, 2);
+  cell.setNumberFormat('@STRING@');
+  cell.setValue(value);
+}
+
+/* ===========================
+   Validation helpers
+=========================== */
+
+function validateReadSheet_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return { headers: [], hIdx: new Map(), data: [] };
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const hIdx    = buildHeaderIndex_(headers);
+
+  if (lastRow < 2) return { headers, hIdx, data: [] };
+
+  const data = sheet.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+  return { headers, hIdx, data };
+}
+
+function validateHeaders_(tabName, headers, requiredHeaders) {
+  const idx = buildHeaderIndex_(headers);
+  for (const h of requiredHeaders) {
+    if (!idx.has(norm_(h))) {
+      return `Tab "${tabName}" missing required header: "${h}"`;
+    }
+  }
+  return '';
+}
+
+function validateNoPartialRows_(tabName, headers, data, keyHeader, excludeHeaders) {
+  const idx      = buildHeaderIndex_(headers);
+  const keyCol   = idx.get(norm_(keyHeader));
+  const excludes = new Set((excludeHeaders || []).map(norm_));
+
+  const colsToCheck = headers
+    .map((h, i) => ({ h, i }))
+    .filter(({ h }) => !excludes.has(norm_(h)));
+
+  for (const r of data) {
+    const key = String(r[keyCol] || '').trim();
+    if (!key) continue;
+
+    const anyFilled = colsToCheck.some(({ i }) => !isBlank_(r[i]));
+    if (!anyFilled) continue;
+
+    for (const { h, i } of colsToCheck) {
+      if (isBlank_(r[i])) {
+        return `Tab "${tabName}" has partial row for "${key}" — missing "${h}".`;
+      }
+    }
+  }
+  return '';
+}
+
+function validateAllFilledExcept_(tabName, headers, data, keyHeader, excludeHeaders) {
+  const idx      = buildHeaderIndex_(headers);
+  const keyCol   = idx.get(norm_(keyHeader));
+  const excludes = new Set((excludeHeaders || []).map(norm_));
+
+  const colsToCheck = headers
+    .map((h, i) => ({ h, i }))
+    .filter(({ h }) => !excludes.has(norm_(h)));
+
+  for (const r of data) {
+    const key = String(r[keyCol] || '').trim();
+    if (!key) continue;
+
+    for (const { h, i } of colsToCheck) {
+      if (isBlankStrict_(r[i])) {
+        return `Tab "${tabName}" incomplete for "${key}" — missing "${h}".`;
+      }
+    }
+  }
+  return '';
+}
+
+function isBlank_(v) {
+  return String(v === null || v === undefined ? '' : v).trim() === '';
+}
+
+function isBlankStrict_(v) {
+  const s = String(v === null || v === undefined ? '' : v).trim();
+  return s === '';
+}

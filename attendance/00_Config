@@ -1,0 +1,56 @@
+/***************
+ * 00_Config.gs
+ * Global constants (declare once)
+ ***************/
+
+const EMP_MASTER_SPREADSHEET_ID = "1yqQ-edwQzZd0pAlaXCAAZt88MbsHfCf4hCcxti4ojCw";
+const EMP_MASTER_SHEET_ID = 1874110664;
+
+const LEAVE_MASTER_SPREADSHEET_ID = "1kVV5Vu8dPGdgGSAu7rZCz9I9L0XlJiQBE-Opv7izDfk";
+const LEAVE_MASTER_SHEET_ID = 0; // LEAVE_MASTER tab (by ID)
+
+// ✅ NEW: Approved Leave Ledger tab (by ID)
+const APPROVED_LEAVE_LEDGER_SHEET_ID = 1577916656;
+
+const SHARED_SUMMARY_SHEET_ID = 1839786889;
+
+const ATTENDANCE_SHEET_NAME = "Attendance entry";
+const LEAVE_BALANCES_SHEET_NAME = "Leave Balances";
+
+const MONTHLY_ATTENDANCE_FOLDER_ID = "1J41gX6opHfav0SPuFotK7lzcyeHGqbnk";
+
+const LOCK_COL = 60; // Locked status column
+const LOCK_PROTECTION_PREFIX = "AUTO_LOCK_COL_PROTECT_";
+
+const STATIC_COLS_COUNT = 8;
+const DATE_START_COL = 9;
+const DATE_END_COL = 39;
+
+const SUNDAY_PROTECTION_PREFIX = "AUTO_SUNDAY_PROTECT_";
+
+const APPROVED_HEADERS_TO_CLEAR = [
+  "APPROVED EL DAYS",
+  "APPROVED SL DAYS",
+  "APPROVED CL DAYS",
+  "MANAGEMET APPROVEL FOR LONG LEAVES"
+];
+
+// Existing sheets
+const LATE_ENTRY_SHEET_NAME = "Late Entry";
+const OT_ENTRY_SHEET_NAME = "OT Entry";
+const CARRY_FORWARDED_SHEET_NAME = "Carry Forwarded";
+const OTHER_PAYMENTS_SHEET_NAME = "Other Payments";
+const OTHER_DEDUCTIONS_SHEET_NAME = "Other Deductions";
+
+// ✅ Salary Advance deductions tab (Attendance file)
+const SALARY_ADVANCE_DEDUCTIONS_SHEET_NAME = "Salary Advance deductions";
+
+// ✅ Salary Advance Master
+const SALARY_ADVANCE_MASTER_SPREADSHEET_ID = "172uLkW5v1Dr_fYO8rZ3GaAwYEyYyRc_n0PaVYjHDwUg";
+const MASTER_EMI_SCHEDULE_SHEET_NAME = "EMI_SCHEDULE";
+const MASTER_SHARED_EMI_SUMMARY_SHEET_NAME = "Shared EMI Summary";
+
+// ✅ (Optional) Master EMI status values (used in filters)
+const EMI_STATUS_ACTIVE = "ACTIVE";
+const EMI_STATUS_CANCELLED = "CANCELLED";
+const EMI_STATUS_CANCELLED_GOT_PAID = "CANCELLED & GOT PAID";

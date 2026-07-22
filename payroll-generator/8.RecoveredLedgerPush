@@ -1,0 +1,129 @@
+function glpPushRecoveredLedgerSnapshot_(attendanceSS) {
+  const attendanceFileName = attendanceSS.getName();
+  const sheetName = "Salary Advance deductions";
+
+  const sh = attendanceSS.getSheetByName(sheetName);
+  if (!sh) throw new Error(`Sheet not found in Attendance file: ${sheetName}`);
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+
+  const lastCol = sh.getLastColumn();
+
+  const headers = sh
+    .getRange(1, 1, 1, lastCol)
+    .getDisplayValues()[0]
+    .map(h => String(h || "").trim().toUpperCase());
+
+  const map = {};
+  headers.forEach((h, i) => {
+    if (h) map[h] = i;
+  });
+
+  function req(header) {
+    const key = String(header || "").trim().toUpperCase();
+    if (!(key in map)) {
+      throw new Error(`Missing required header in ${sheetName}: ${header}`);
+    }
+    return map[key];
+  }
+
+  const A = {
+    month: req("MONTH"),
+    emp: req("EMPLOYEE CODE"),
+    name: req("NAME"),
+    dept: req("DEPARTMENT"),
+    ref: req("EMI REFERENCE NUMBER"),
+    emiAmt: req("EMI AMOUNT"),
+    curBal: req("CURRENT BALANCE"),
+    hrDecision: req("HR DECISION"),
+    recoveredAmt: req("RECOVERED AMOUNT"),
+    payroll: req("PAYROLL STATUS"),
+  };
+
+  const values = sh
+    .getRange(2, 1, lastRow - 1, lastCol)
+    .getDisplayValues();
+
+  const out = [];
+
+  values.forEach(r => {
+    const ref = String(r[A.ref] || "").trim();
+    if (!ref) return;
+
+    const payroll = String(r[A.payroll] || "")
+      .trim()
+      .toUpperCase();
+
+    if (!payroll.startsWith("LOCKED")) return;
+
+    out.push([
+      attendanceFileName,
+      r[A.month] || "",
+      r[A.emp] || "",
+      r[A.name] || "",
+      r[A.dept] || "",
+      ref,
+      r[A.emiAmt] || "",
+      r[A.curBal] || "",
+      r[A.hrDecision] || "",
+      r[A.recoveredAmt] || "",
+    ]);
+  });
+
+  if (!out.length) return;
+
+  const masterSS = SpreadsheetApp.openById(GLP_SALARY_ADVANCE_MASTER_ID);
+
+  const led = masterSS.getSheetByName(
+    GLP_RECOVERED_LEDGER_SHEET_NAME
+  );
+
+  if (!led) {
+    throw new Error(
+      `Master sheet not found: ${GLP_RECOVERED_LEDGER_SHEET_NAME}`
+    );
+  }
+
+  const ledLastRow = led.getLastRow();
+
+  if (ledLastRow >= 2) {
+    const existing = led
+      .getRange(2, 1, ledLastRow - 1, 1)
+      .getDisplayValues();
+
+    const alreadyExists = existing.some(r =>
+      String(r[0] || "").trim() === attendanceFileName
+    );
+
+    if (alreadyExists) return;
+  }
+
+  const maxRows = led.getMaxRows();
+
+  const colA = led
+    .getRange(1, 1, maxRows, 1)
+    .getDisplayValues();
+
+  let startRow = 2;
+
+  for (let i = colA.length - 1; i >= 0; i--) {
+    if (String(colA[i][0] || "").trim() !== "") {
+      startRow = i + 2;
+      break;
+    }
+  }
+
+  const needLast = startRow + out.length - 1;
+
+  if (led.getMaxRows() < needLast) {
+    led.insertRowsAfter(
+      led.getMaxRows(),
+      needLast - led.getMaxRows()
+    );
+  }
+
+  led
+    .getRange(startRow, 1, out.length, out[0].length)
+    .setValues(out);
+}

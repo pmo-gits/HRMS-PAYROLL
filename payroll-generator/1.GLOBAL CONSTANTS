@@ -1,0 +1,268 @@
+/*******************************************************
+ * GLOBAL CONSTANTS — Monthly Payroll Generator System
+ * (No logic here; only IDs, names, headers, rules)
+ *******************************************************/
+
+const CONST = Object.freeze({
+  // ===== Drive / Storage =====
+  FOLDERS: Object.freeze({
+    MONTHLY_PAYROLL_WORKINGS: '1PCjLWUS3kU1iB_Jd4ucZ4Zv_g6oPhCJ0', // all generated payroll files saved here
+
+    // ✅ Monthly Attendance folder (dynamic files live here)
+    MONTHLY_ATTENDANCE: '1J41gX6opHfav0SPuFotK7lzcyeHGqbnk',
+
+    // ✅ NEW
+    LOCKED_PAYROLL_FILES: '1R-J3tbU7MP2lUSkSkV4Buz3ExjnQpSU9',
+    BANK_TRANSFER_FILES: '1Q1re1_-6zpT6zxKGfIgtR_QMQvOjeeKO',
+  }),
+
+  // ===== Templates =====
+  TEMPLATES: Object.freeze({
+    PAYROLL_GENERATOR_SS_ID: '15cwr6REmNDmkd5zyCI-jTkYP1ah8HPouCzmSQC7-uHE',
+    PAYROLL_GENERATOR_PAYROLL_TAB_GID: 842948634,
+    PAYROLL_TAB_NAME: 'PAY_ROLL',
+  }),
+
+  // ===== Fixed Source Spreadsheets (do NOT change monthly) =====
+  SOURCES: Object.freeze({
+    EMPLOYEE_MASTER_SS_ID: '1yqQ-edwQzZd0pAlaXCAAZt88MbsHfCf4hCcxti4ojCw',
+    SALARY_REVISION_HISTORY_SS_ID: '1XsyWVct4LOVMvZMDq4EThD6mgoAoumN-_RNQiwy67KM',
+    PAYROLL_CONTROL_CENTER_SS_ID: '1eAGLD1AYfH9yoB8CaifkzuXPR5oeu2SR-wvjoepImGo',
+    LEAVE_MASTER_SS_ID: '1kVV5Vu8dPGdgGSAu7rZCz9I9L0XlJiQBE-Opv7izDfk',
+    SALARY_ADVANCE_MASTER_SS_ID: '172uLkW5v1Dr_fYO8rZ3GaAwYEyYyRc_n0PaVYjHDwUg',
+  }),
+
+  // ===== Fixed Source Tabs (names are stable) =====
+  TABS: Object.freeze({
+    EMPLOYEE_MASTER: 'Employee Master',
+    REVISION_HISTORY: 'REVISION_HISTORY',
+    PETROL_CONVEYANCE_HISTORY: 'PETROL-CONVEYANCE_HISTORY',
+    ATTENDANCE_ENTRY: 'Attendance entry',
+    LATE_ENTRY: 'Late Entry',
+    OT_ENTRY: 'OT Entry',
+    CARRY_FORWARDED: 'Carry Forwarded',
+    OTHER_PAYMENTS: 'Other Payments',
+    OTHER_DEDUCTIONS: 'Other Deductions',
+    SALARY_ADVANCE_DEDUCTIONS: 'Salary Advance deductions',
+    META_DATA: 'META_DATA',
+    FIXED_SALARY_CHECK: 'FIXED_SALARY_CHECK',
+    PAYROLL_CONTROL_CENTER: 'PAYROLL_CONTROL',
+    UNION_BANK: 'UNION_BANK',
+    OTHER_BANKS: 'OTHER_BANKS',
+    LEAVE_MASTER: 'LEAVE_MASTER',
+    RECOVERED_AMOUNT_LEDGER: 'Recovered Amount Ledger',
+  }),
+
+  LEAVE: Object.freeze({
+    LEAVE_MASTER_SHEET_ID: 0,
+    APPROVED_LEAVE_LEDGER_SHEET_ID: 1577916656,
+  }),
+
+  KEYS: Object.freeze({
+    PAYROLL: 'Employee Code',
+
+    ATTENDANCE_TABS: Object.freeze({
+      'Attendance entry': 'Employee Code',
+      'Late Entry': 'Employee Code',
+      'OT Entry': 'Employee Code',
+      'Carry Forwarded': 'Employee Code',
+      'Other Payments': 'Employee Code',
+      'Other Deductions': 'Employee Code',
+      'Salary Advance deductions': 'Employee Code',
+    }),
+
+    MASTER_TABS: Object.freeze({
+      'Employee Master': 'ID.NO',
+      'REVISION_HISTORY': 'ID.NO',
+      'PETROL-CONVEYANCE_HISTORY': 'ID.NO',
+    }),
+  }),
+
+  REVISION_RULES: Object.freeze({
+    EFFECTIVE_FROM_HEADER: 'EFFECTIVE_FROM',
+    INCREMENT_HEADER: 'CHANGE OF VALUE',
+    COMPONENT_HEADERS: Object.freeze({
+      BASIC: 'BASIC',
+      DA: 'DA',
+      HRA: 'HRA',
+      CONVEYANCE_ALLOWANCE: 'CONV.ALL',
+      SPECIAL_ALLOWANCE: 'SPL.ALL',
+    }),
+  }),
+
+  OTHER_PAYMENTS_RULES: Object.freeze({
+    AMOUNT_HEADER: 'Amount',
+    CONSIDER_UNDER_HEADER: 'Consider Under',
+    CONSIDER_UNDER_VALUES: Object.freeze({
+      GROSS: 'GROSS',
+      NET: 'NET',
+    }),
+  }),
+
+  MAP: Object.freeze({
+    'S.No': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'S.No' },
+    'Employee Code': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'Employee Code' },
+    'Name': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'Name' },
+    'Gender': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'Gender' },
+    'Category': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'Category' },
+    'Date Of Joining': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'DOJ' },
+    'Department': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'Department' },
+    'Designation': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'Designation' },
+    'Total Working Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'TOTAL WORKING DAYS' },
+    'Total Present Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'TOTAL PRESENT DAYS' },
+    'LOP Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'LOP DAYS' },
+    'Final Payable Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'FINAL PAYABLE DAYS' },
+    'Approved EL Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'APPROVED EL DAYS' },
+    'Approved CL Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'APPROVED CL DAYS' },
+    'Approved SL Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'APPROVED SL DAYS' },
+    'Layoff Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Attendance entry', targetHeader: 'LAYOFF DAYS' },
+    'Late Penalty': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Late Entry', targetHeader: 'LATE PENALTY COUNT' },
+    'Carry Forward Days': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Carry Forwarded', targetHeader: 'Carry Forwarded Days' },
+    'OT Hours': { sheet: 'ATTENDANCE_MONTHLY', tab: 'OT Entry', targetHeader: 'Total OT Hours' },
+    'Skill Group': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'SKILL GROUP' },
+    'UAN No': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'UAN NO' },
+    'ESI No': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'ESI NO' },
+    'Bank Account No': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'BANK ACCOUNT NO' },
+    'IFSC Code': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'IFSC CODE' },
+    'Aadhaar No': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'AADHAAR NO' },
+    'Attendance Bonus Applicability': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'ATTENDANCE BONUS APPLICABILITY' },
+    'PF Applicability': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'PF APPLICABILITY' },
+    'ESI Applicability': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'ESI APPLICABILITY' },
+    'Basic': { sheet: 'SALARY_REVISION_HISTORY', tab: 'REVISION_HISTORY', targetHeader: 'BASIC', subRule: 'EFFECTIVE_FROM_ASOF' },
+    'DA': { sheet: 'SALARY_REVISION_HISTORY', tab: 'REVISION_HISTORY', targetHeader: 'DA', subRule: 'EFFECTIVE_FROM_ASOF' },
+    'HRA': { sheet: 'SALARY_REVISION_HISTORY', tab: 'REVISION_HISTORY', targetHeader: 'HRA', subRule: 'EFFECTIVE_FROM_ASOF' },
+    'Conveyance Allowance': { sheet: 'SALARY_REVISION_HISTORY', tab: 'REVISION_HISTORY', targetHeader: 'CONV.ALL', subRule: 'EFFECTIVE_FROM_ASOF' },
+    'Special Allowance': { sheet: 'SALARY_REVISION_HISTORY', tab: 'REVISION_HISTORY', targetHeader: 'SPL.ALL', subRule: 'EFFECTIVE_FROM_ASOF' },
+    'Increment': { sheet: 'SALARY_REVISION_HISTORY', tab: 'REVISION_HISTORY', targetHeader: 'CHANGE OF VALUE', subRule: 'EFFECTIVE_FROM_MATCH_MONTH_ONLY' },
+    'Petrol Conveyance': { sheet: 'SALARY_REVISION_HISTORY', tab: 'PETROL-CONVEYANCE_HISTORY', targetHeader: 'PETROL CONVEYANCE' },
+    'Other Payments [Gross]': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Other Payments', targetHeader: 'Amount', subRule: 'CONSIDER_UNDER=GROSS' },
+    'Other Payments [Net]': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Other Payments', targetHeader: 'Amount', subRule: 'CONSIDER_UNDER=NET' },
+    'Advance Deduction': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Salary Advance deductions', targetHeader: 'Planned EMI' },
+    'Other Deductions': { sheet: 'ATTENDANCE_MONTHLY', tab: 'Other Deductions', targetHeader: 'Amount' },
+    'LWF': { sheet: 'MANUAL_OR_RULE', tab: '-', targetHeader: '-', subRule: 'DECEMBER_WORKER_ONLY_20' },
+    'Payroll Release Confirmation': { sheet: 'DATA_VALIDATION', tab: '-', targetHeader: '-', subRule: 'PROCEED_OR_HOLD' },
+    'Bank Transfer Mark Down': { sheet: 'SCRIPT_CONTROLLED', tab: '-', targetHeader: '-', subRule: 'TIMESTAMP_ON_BANK_TRANSFER' },
+  }),
+
+  NON_SCRIPT_COLUMNS: Object.freeze([
+    'Total Days',
+    'Basic+DA',
+    'Gross',
+    'Earned Basic',
+    'Earned DA',
+    'Earned Basic + DA',
+    'Earned HRA',
+    'Layoff HRA',
+    'Earned Conveyance Allowance',
+    'Earned Special Allowance',
+    'Earned Total',
+    'Late Deduction',
+    'OT Pay',
+    'Earned Petrol Conveyance',
+    'Attendance Bonus',
+    'Carry Forward Pay',
+    'Total Earnings',
+    'Employer PF',
+    'Employee PF',
+    'Employer ESI',
+    'Employee ESI',
+    'Professional Tax',
+    'TDS',
+    'Total Deductions',
+    'NET',
+  ]),
+
+  META_KEYS: Object.freeze({
+    PAYROLL_MONTH_LABEL: 'PAYROLL_MONTH_LABEL',
+    ATTENDANCE_FILE_ID: 'ATTENDANCE_FILE_ID',
+    ATTENDANCE_VALIDATION: 'ATTENDANCE_VALIDATION',
+    ATTENDANCE_LAST_UPDATED: 'ATTENDANCE_LAST_UPDATED',
+    LOCK_STATUS: 'LOCK_STATUS',
+    LOCKED_FILE_ID: 'LOCKED_FILE_ID',
+    LOCKED_ON: 'LOCKED_ON',
+    LOCKED_BY: 'LOCKED_BY',
+    BANK_TRANSFER_FILE_ID: 'BANK_TRANSFER_FILE_ID',
+    BANK_TRANSFER_LAST_BATCH_TIMESTAMP: 'BANK_TRANSFER_LAST_BATCH_TIMESTAMP',
+    UNION_BANK_AMOUNT: 'UNION_BANK_AMOUNT',
+    OTHER_BANK_AMOUNT: 'OTHER_BANK_AMOUNT',
+    TOTAL_BANK_TRANSFERRED_AMOUNT: 'TOTAL_BANK_TRANSFERRED_AMOUNT',
+  }),
+
+  CONTROL_CENTER_HEADERS: Object.freeze({
+    PAYROLL_MONTH_KEY: 'PAYROLL_MONTH_KEY',
+    MONTH: 'MONTH',
+    YEAR: 'YEAR',
+    PAYROLL_WORKINGS_FILE_NAME: 'PAYROLL_WORKINGS_FILE_NAME',
+    PAYROLL_WORKINGS_FILE_ID: 'PAYROLL_WORKINGS_FILE_ID',
+    CREATED_ON: 'CREATED_ON',
+    CREATED_BY: 'CREATED_BY',
+    LOCKED_ATTENDANCE_FILE_ID: 'LOCKED_ATTENDANCE_FILE_ID',
+    LOCKED_PAYROLL_FILE_NAME: 'LOCKED_PAYROLL_FILE_NAME',
+    LOCKED_PAYROLL_FILE_ID: 'LOCKED_PAYROLL_FILE_ID',
+    BANK_TRANSFER_FILE_NAME: 'BANK_TRANSFER_FILE_NAME',
+    BANK_TRANSFER_FILE_ID: 'BANK_TRANSFER_FILE_ID',
+    LOCK_STATUS: 'LOCK_STATUS',
+    LOCKED_ON: 'LOCKED_ON',
+    LOCKED_BY: 'LOCKED_BY',
+    REMARKS: 'REMARKS',
+  }),
+
+  BANK_TRANSFER_RULES: Object.freeze({
+    FILE_PREFIX: 'BankTransfer',
+    UNION_IFSC_IDENTIFIER: 'UBIN',
+    PAYROLL_RELEASE_HEADER: 'Payroll Release Confirmation',
+    BANK_TRANSFER_MARKDOWN_HEADER: 'Bank Transfer Mark Down',
+    NET_HEADER: 'NET',
+    EMPLOYEE_CODE_HEADER: 'Employee Code',
+    NAME_HEADER: 'Name',
+    BANK_ACCOUNT_NO_HEADER: 'Bank Account No',
+    IFSC_CODE_HEADER: 'IFSC Code',
+
+    TABS: Object.freeze({
+      UNION_BANK: 'UNION_BANK',
+      OTHER_BANKS: 'OTHER_BANKS',
+    }),
+
+    OUTPUT_HEADERS: Object.freeze([
+      'Transfer_Batch_Timestamp',
+      'Employee Code',
+      'Name',
+      'Bank Account No',
+      'IFSC Code',
+      'NET Amount',
+    ]),
+
+    SKIPPED_VALUES: Object.freeze({
+      NET_ZERO: 'SKIPPED - NET 0',
+      NET_NEGATIVE: 'SKIPPED - NEGATIVE',
+    }),
+  }),
+
+  LOCK_RULES: Object.freeze({
+    LOCKED_FILE_PREFIX: 'Payroll-Locked',
+    OWNER_EMAIL: 'pmo@butlerleather.com',
+    VIEWER_EMAILS: Object.freeze([
+      'hrassist@butlerleather.com',
+      'nazneen@butlerleather.com',
+    ]),
+  }),
+
+  VALUES: Object.freeze({
+    LOCK_STATUS_OPEN: 'OPEN',
+    LOCK_STATUS_LOCKED: 'LOCKED',
+    PAYROLL_RELEASE_PROCEED: 'PROCEED',
+    PAYROLL_RELEASE_HOLD: 'HOLD',
+  }),
+});
+
+/*******************************************************
+ * POST LOCK PUSH — LEGACY CONSTANT COMPATIBILITY
+ * Required by existing GLP push functions
+ *******************************************************/
+
+const GLP_SALARY_ADVANCE_MASTER_ID = CONST.SOURCES.SALARY_ADVANCE_MASTER_SS_ID;
+const GLP_RECOVERED_LEDGER_SHEET_NAME = CONST.TABS.RECOVERED_AMOUNT_LEDGER;
+
+const GLP_LEAVE_MASTER_SPREADSHEET_ID = CONST.SOURCES.LEAVE_MASTER_SS_ID;
+const GLP_APPROVED_LEAVE_LEDGER_SHEET_ID = CONST.LEAVE.APPROVED_LEAVE_LEDGER_SHEET_ID;
+const GLP_LEAVE_MASTER_SHEET_ID = CONST.LEAVE.LEAVE_MASTER_SHEET_ID;

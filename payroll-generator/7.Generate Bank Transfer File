@@ -1,0 +1,756 @@
+/*******************************************************
+ * 7.Generate Bank Transfer File
+ *
+ * USER GATE:
+ * ✅ pmo@butlerleather.com      → runs directly
+ * ✅ nazneen@butlerleather.com  → runs via Web App (as owner)
+ * ✅ Others                     → blocked
+ *******************************************************/
+
+const BTF = Object.freeze({
+  SHEETS: Object.freeze({
+    PAY_ROLL: 'PAY_ROLL',
+    META_DATA: 'META_DATA',
+    UNION_BANK: 'UNION_BANK',
+    OTHER_BANKS: 'OTHER_BANKS',
+  }),
+
+  HEADERS: Object.freeze({
+    EMPLOYEE_CODE: 'Employee Code',
+    NAME: 'Name',
+    BANK_ACCOUNT_NO: 'Bank Account No',
+    IFSC_CODE: 'IFSC Code',
+    NET: 'NET',
+    PAYROLL_RELEASE_CONFIRMATION: 'Payroll Release Confirmation',
+    BANK_TRANSFER_MARK_DOWN: 'Bank Transfer Mark Down',
+  }),
+
+  OUTPUT_HEADERS: Object.freeze([
+    'Transfer_Batch_Timestamp',
+    'Employee Code',
+    'Name',
+    'Bank Account No',
+    'IFSC Code',
+    'NET Amount',
+  ]),
+
+  META_KEYS: Object.freeze({
+    PAYROLL_MONTH_LABEL: 'PAYROLL_MONTH_LABEL',
+    LOCK_STATUS: 'LOCK_STATUS',
+    BANK_TRANSFER_FILE_ID: 'BANK_TRANSFER_FILE_ID',
+    BANK_TRANSFER_LAST_BATCH_TIMESTAMP: 'BANK_TRANSFER_LAST_BATCH_TIMESTAMP',
+    UNION_BANK_AMOUNT: 'UNION_BANK_AMOUNT',
+    OTHER_BANK_AMOUNT: 'OTHER_BANK_AMOUNT',
+    TOTAL_BANK_TRANSFERRED_AMOUNT: 'TOTAL_BANK_TRANSFERRED_AMOUNT',
+  }),
+
+  VALUES: Object.freeze({
+    PROCEED: 'PROCEED',
+    LOCKED: 'LOCKED',
+    SKIPPED_NET_0: 'SKIPPED - NET 0',
+    SKIPPED_NEGATIVE: 'SKIPPED - NEGATIVE',
+  }),
+
+  FILE: Object.freeze({
+    PREFIX: 'BankTransfer',
+  }),
+
+  PROTECTION: Object.freeze({
+    PAYROLL_TRANSFER_LOCK_PREFIX: 'BANK_TRANSFER_PAYROLL_LOCK',
+    BANK_FILE_PROTECTION_PREFIX: 'BANK_TRANSFER_FILE_LOCK',
+    CONTROL_LOCK_PREFIX: 'BANK_TRANSFER_CONTROL_LOCK',
+  }),
+
+  ACCESS: Object.freeze({
+    EDITORS: Object.freeze([
+      'nazneen@butlerleather.com',
+    ]),
+    VIEWERS: Object.freeze([
+      'hrassist@butlerleather.com',
+    ]),
+  }),
+});
+
+const BTF_OWNER_EMAIL  = 'pmo@butlerleather.com';
+const BTF_ALLOWED_EMAIL = 'nazneen@butlerleather.com';
+
+/* =========================================================
+   ENTRY POINT
+========================================================= */
+
+function generateBankTransferFile() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    // ── Owner: run directly ──
+    if (currentUser === BTF_OWNER_EMAIL.toLowerCase()) {
+      generateBankTransferFileServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      return;
+    }
+
+    // ── Allowed user: call Web App (runs as owner) ──
+    if (currentUser === BTF_ALLOWED_EMAIL.toLowerCase()) {
+      if (!GLP_WEBAPP_URL || GLP_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert(
+          'Generate Bank Transfer File',
+          'Web App URL is not configured. Please deploy the Web App and paste the URL in GLP_WEBAPP_URL.',
+          ui.ButtonSet.OK
+        );
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(GLP_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'generateBankTransferFile',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      if (result.message) {
+        ui.alert('Generate Bank Transfer File', result.message, ui.ButtonSet.OK);
+      }
+      return;
+    }
+
+    // ── Anyone else: blocked ──
+    ui.alert(
+      'Generate Bank Transfer File',
+      'You are not authorized to run this function.',
+      ui.ButtonSet.OK
+    );
+
+  } catch (err) {
+    ui.alert(
+      'Generate Bank Transfer File',
+      `Error: ${err && err.message ? err.message : err}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function generateBankTransferFileServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  const runMode       = String(payload.runMode || 'webapp').trim();
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    return { success: false, message: 'Another bank transfer generation is already running. Please wait and try again.' };
+  }
+
+  let ui = null;
+  if (runMode === 'direct') {
+    try { ui = SpreadsheetApp.getUi(); } catch (_) { ui = null; }
+  }
+
+  const alert_ = (msg) => {
+    if (ui) ui.alert('Generate Bank Transfer File', msg, ui.ButtonSet.OK);
+    return { success: false, message: msg };
+  };
+
+  try {
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+
+    const payrollSh = ss.getSheetByName(BTF.SHEETS.PAY_ROLL);
+    if (!payrollSh) throw new Error(`Missing sheet: ${BTF.SHEETS.PAY_ROLL}`);
+
+    const metaSh = ss.getSheetByName(BTF.SHEETS.META_DATA);
+    if (!metaSh) throw new Error(`Missing sheet: ${BTF.SHEETS.META_DATA}`);
+
+    const lockStatus = String(btfGetMetaValue_(metaSh, BTF.META_KEYS.LOCK_STATUS) || '').trim().toUpperCase();
+    if (lockStatus !== BTF.VALUES.LOCKED) {
+      return alert_('Payroll is not LOCKED. Bank Transfer File can be generated only after LOCK_STATUS = LOCKED in META_DATA.');
+    }
+
+    const monthLabel = btfGetMetaValue_(metaSh, BTF.META_KEYS.PAYROLL_MONTH_LABEL);
+    if (!monthLabel) {
+      return alert_('PAYROLL_MONTH_LABEL is missing in META_DATA.');
+    }
+
+    const batchTimestamp = Utilities.formatDate(
+      new Date(),
+      Session.getScriptTimeZone(),
+      'yyyy-MM-dd HH:mm'
+    );
+
+    const payrollLastRow = payrollSh.getLastRow();
+    const payrollLastCol = payrollSh.getLastColumn();
+
+    if (payrollLastRow < 2 || payrollLastCol < 1) {
+      return alert_('No payroll data found.');
+    }
+
+    const payrollHeaders = payrollSh.getRange(1, 1, 1, payrollLastCol).getDisplayValues()[0];
+    const payrollIdx = btfBuildHeaderIndex_(payrollHeaders);
+
+    const empCodeCol     = btfRequireHeader_(payrollIdx, BTF.HEADERS.EMPLOYEE_CODE, BTF.SHEETS.PAY_ROLL);
+    const nameCol        = btfRequireHeader_(payrollIdx, BTF.HEADERS.NAME, BTF.SHEETS.PAY_ROLL);
+    const bankAccountCol = btfRequireHeader_(payrollIdx, BTF.HEADERS.BANK_ACCOUNT_NO, BTF.SHEETS.PAY_ROLL);
+    const ifscCol        = btfRequireHeader_(payrollIdx, BTF.HEADERS.IFSC_CODE, BTF.SHEETS.PAY_ROLL);
+    const netCol         = btfRequireHeader_(payrollIdx, BTF.HEADERS.NET, BTF.SHEETS.PAY_ROLL);
+    const releaseCol     = btfRequireHeader_(payrollIdx, BTF.HEADERS.PAYROLL_RELEASE_CONFIRMATION, BTF.SHEETS.PAY_ROLL);
+    const markDownCol    = btfRequireHeader_(payrollIdx, BTF.HEADERS.BANK_TRANSFER_MARK_DOWN, BTF.SHEETS.PAY_ROLL);
+
+    const payrollData = payrollSh.getRange(2, 1, payrollLastRow - 1, payrollLastCol).getDisplayValues();
+
+    let existingBankTransferFileId = btfExtractSpreadsheetId_(
+      btfGetMetaValue_(metaSh, BTF.META_KEYS.BANK_TRANSFER_FILE_ID)
+    );
+
+    let bankFile;
+    let bankSs;
+
+    if (existingBankTransferFileId) {
+      bankFile = DriveApp.getFileById(existingBankTransferFileId);
+      bankSs   = SpreadsheetApp.openById(existingBankTransferFileId);
+    } else {
+      const fileName = `${BTF.FILE.PREFIX}_${monthLabel}`;
+      bankSs   = SpreadsheetApp.create(fileName);
+      bankFile = DriveApp.getFileById(bankSs.getId());
+
+      const folder = DriveApp.getFolderById(CONST.FOLDERS.BANK_TRANSFER_FILES);
+      bankFile.moveTo(folder);
+
+      existingBankTransferFileId = bankSs.getId();
+    }
+
+    btfApplyBankTransferFilePermissions_(bankFile);
+
+    const unionSh = btfGetOrCreateOutputSheet_(bankSs, BTF.SHEETS.UNION_BANK);
+    const otherSh = btfGetOrCreateOutputSheet_(bankSs, BTF.SHEETS.OTHER_BANKS);
+
+    btfRemoveDefaultSheet1_(bankSs);
+    btfRemoveBankFileProtections_(bankSs);
+
+    // ── CHANGE 1: Apply text formats BEFORE data is written ──
+    btfApplyTextColumnFormats_(unionSh);
+    btfApplyTextColumnFormats_(otherSh);
+
+    const unionRows              = [];
+    const otherRows              = [];
+    const skippedUpdates         = [];
+    const transferredUpdates     = [];
+    const transferredPayrollRows = [];
+
+    let unionBatchAmount = 0;
+    let otherBatchAmount = 0;
+
+    for (let i = 0; i < payrollData.length; i++) {
+      const row      = payrollData[i];
+      const sheetRow = i + 2;
+
+      const empCode = String(row[empCodeCol] || '').trim();
+      if (!empCode) continue;
+
+      const releaseStatus = String(row[releaseCol] || '').trim().toUpperCase();
+      if (releaseStatus !== BTF.VALUES.PROCEED) continue;
+
+      const markDownValue = String(row[markDownCol] || '').trim();
+      if (btfIsAlreadyTransferred_(markDownValue)) continue;
+
+      const netAmount = btfToNumber_(row[netCol]);
+
+      if (netAmount === 0) {
+        skippedUpdates.push({ row: sheetRow, value: BTF.VALUES.SKIPPED_NET_0 });
+        continue;
+      }
+
+      if (netAmount < 0) {
+        skippedUpdates.push({ row: sheetRow, value: BTF.VALUES.SKIPPED_NEGATIVE });
+        continue;
+      }
+
+      const name          = String(row[nameCol] || '').trim();
+      const bankAccountNo = String(row[bankAccountCol] || '').trim();
+      const ifscCode      = String(row[ifscCol] || '').trim();
+
+      const outputRow = [
+        batchTimestamp,
+        empCode,
+        name,
+        bankAccountNo,
+        ifscCode,
+        netAmount,
+      ];
+
+      if (ifscCode.toUpperCase().indexOf('UBIN') !== -1) {
+        unionRows.push(outputRow);
+        unionBatchAmount += netAmount;
+      } else {
+        otherRows.push(outputRow);
+        otherBatchAmount += netAmount;
+      }
+
+      transferredUpdates.push({ row: sheetRow, value: batchTimestamp });
+      transferredPayrollRows.push(sheetRow);
+    }
+
+    if (!unionRows.length && !otherRows.length && !skippedUpdates.length) {
+      btfRestoreBankFileProtections_(bankSs);
+      return alert_('No new eligible rows found for bank transfer.');
+    }
+
+    if (unionRows.length) btfAppendRows_(unionSh, unionRows);
+    if (otherRows.length) btfAppendRows_(otherSh, otherRows);
+
+    btfApplyBasicFormatting_(unionSh);
+    btfApplyBasicFormatting_(otherSh);
+
+    const existingUnionTotal = btfToNumber_(btfGetMetaValue_(metaSh, BTF.META_KEYS.UNION_BANK_AMOUNT));
+    const existingOtherTotal = btfToNumber_(btfGetMetaValue_(metaSh, BTF.META_KEYS.OTHER_BANK_AMOUNT));
+
+    const newUnionTotal  = existingUnionTotal + unionBatchAmount;
+    const newOtherTotal  = existingOtherTotal + otherBatchAmount;
+    const newGrandTotal  = newUnionTotal + newOtherTotal;
+
+    btfSetMetaHyperlink_(metaSh, BTF.META_KEYS.BANK_TRANSFER_FILE_ID, existingBankTransferFileId);
+    btfSetMetaValue_(metaSh, BTF.META_KEYS.BANK_TRANSFER_LAST_BATCH_TIMESTAMP, batchTimestamp);
+    btfSetMetaValue_(metaSh, BTF.META_KEYS.UNION_BANK_AMOUNT, newUnionTotal);
+    btfSetMetaValue_(metaSh, BTF.META_KEYS.OTHER_BANK_AMOUNT, newOtherTotal);
+    btfSetMetaValue_(metaSh, BTF.META_KEYS.TOTAL_BANK_TRANSFERRED_AMOUNT, newGrandTotal);
+
+    btfUpdatePayrollControlCenter_({
+      monthLabel: monthLabel,
+      bankTransferFileName: bankFile.getName(),
+      bankTransferFileId: existingBankTransferFileId,
+    });
+
+    btfWriteMarkDownUpdates_(payrollSh, markDownCol + 1, skippedUpdates);
+    btfWriteMarkDownUpdates_(payrollSh, markDownCol + 1, transferredUpdates);
+
+    if (transferredPayrollRows.length) {
+      btfProtectPayrollTransferColumnsByBlocks_(
+        payrollSh,
+        transferredPayrollRows,
+        [releaseCol + 1, markDownCol + 1],
+        monthLabel
+      );
+    }
+
+    btfRestoreBankFileProtections_(bankSs);
+
+    const successMsg =
+      `Bank transfer batch completed successfully.\n\n` +
+      `Batch Timestamp: ${batchTimestamp}\n` +
+      `UNION_BANK rows: ${unionRows.length}\n` +
+      `OTHER_BANKS rows: ${otherRows.length}\n` +
+      `Skipped rows marked: ${skippedUpdates.length}\n\n` +
+      `Union Bank Amount: ${unionBatchAmount}\n` +
+      `Other Banks Amount: ${otherBatchAmount}\n` +
+      `Total Batch Amount: ${unionBatchAmount + otherBatchAmount}`;
+
+    if (ui) ui.alert('Generate Bank Transfer File', successMsg, ui.ButtonSet.OK);
+    return { success: true, message: successMsg };
+
+  } catch (err) {
+    return alert_(`Error: ${err && err.message ? err.message : err}`);
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+
+/* =========================================================
+   OUTPUT FILE
+========================================================= */
+
+function btfGetOrCreateOutputSheet_(ss, sheetName) {
+  let sh = ss.getSheetByName(sheetName);
+
+  if (!sh) {
+    sh = ss.insertSheet(sheetName);
+  }
+
+  sh.getRange(1, 1, 1, BTF.OUTPUT_HEADERS.length).setValues([BTF.OUTPUT_HEADERS]);
+
+  return sh;
+}
+
+function btfRemoveDefaultSheet1_(ss) {
+  const sh = ss.getSheetByName('Sheet1');
+
+  if (!sh) return;
+  if (ss.getSheets().length <= 1) return;
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  const hasData = lastRow > 1 || lastCol > 1 || String(sh.getRange(1, 1).getDisplayValue() || '').trim() !== '';
+
+  if (!hasData) {
+    ss.deleteSheet(sh);
+  }
+}
+
+function btfAppendRows_(sh, rows) {
+  if (!rows || !rows.length) return;
+
+  const startRow = Math.max(sh.getLastRow() + 1, 2);
+  sh.getRange(startRow, 1, rows.length, BTF.OUTPUT_HEADERS.length).setValues(rows);
+}
+
+// ── CHANGE 2: New function — sets Plain Text format on columns 2, 4, 5
+//             Must be called BEFORE btfAppendRows_() so Sheets respects
+//             the format when values are written ──
+function btfApplyTextColumnFormats_(sh) {
+  const maxRows = sh.getMaxRows();
+  if (maxRows < 2) return;
+  sh.getRange(2, 2, maxRows - 1, 1).setNumberFormat('@'); // Employee Code
+  sh.getRange(2, 4, maxRows - 1, 1).setNumberFormat('@'); // Bank Account No
+  sh.getRange(2, 5, maxRows - 1, 1).setNumberFormat('@'); // IFSC Code
+}
+
+function btfApplyBasicFormatting_(sh) {
+  const lastCol = BTF.OUTPUT_HEADERS.length;
+  const lastRow = Math.max(sh.getLastRow(), 1);
+
+  sh.setFrozenRows(1);
+
+  const fullRange = sh.getRange(1, 1, lastRow, lastCol);
+  fullRange
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setBorder(true, true, true, true, true, true);
+
+  sh.getRange(1, 1, 1, lastCol)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+
+  if (lastRow >= 2) {
+    sh.getRange(2, 1, lastRow - 1, lastCol).setWrap(false);
+    sh.getRange(2, 1, lastRow - 1, 1).setNumberFormat('yyyy-mm-dd hh:mm');
+    sh.getRange(2, 6, lastRow - 1, 1).setNumberFormat('#,##0');
+  }
+
+  sh.setColumnWidth(1, 160);
+  sh.setColumnWidth(2, 120);
+  sh.setColumnWidth(3, 220);
+  sh.setColumnWidth(4, 200);
+  sh.setColumnWidth(5, 140);
+  sh.setColumnWidth(6, 130);
+}
+
+function btfApplyBankTransferFilePermissions_(file) {
+  BTF.ACCESS.EDITORS.forEach(email => {
+    try { file.addEditor(email); } catch (_) {}
+  });
+
+  BTF.ACCESS.VIEWERS.forEach(email => {
+    try { file.addViewer(email); } catch (_) {}
+  });
+}
+
+
+/* =========================================================
+   PAYROLL MARK DOWN + PROTECTION
+========================================================= */
+
+function btfWriteMarkDownUpdates_(sh, markDownCol1, updates) {
+  if (!updates || !updates.length) return;
+
+  for (let i = 0; i < updates.length; i++) {
+    sh.getRange(updates[i].row, markDownCol1).setValue(updates[i].value);
+  }
+}
+
+function btfIsAlreadyTransferred_(value) {
+  const text = String(value || '').trim();
+
+  if (!text) return false;
+  if (text === BTF.VALUES.SKIPPED_NET_0) return false;
+  if (text === BTF.VALUES.SKIPPED_NEGATIVE) return false;
+
+  return true;
+}
+
+function btfProtectPayrollTransferColumnsByBlocks_(sh, rows, colNumbers1Based, monthLabel) {
+  if (!rows || !rows.length || !colNumbers1Based || !colNumbers1Based.length) return;
+
+  const blocks = btfBuildContinuousRowBlocks_(rows);
+
+  for (let c = 0; c < colNumbers1Based.length; c++) {
+    const col = colNumbers1Based[c];
+
+    for (let i = 0; i < blocks.length; i++) {
+      const block   = blocks[i];
+      const numRows = block.end - block.start + 1;
+
+      const range      = sh.getRange(block.start, col, numRows, 1);
+      const protection = range.protect();
+
+      protection.setDescription(
+        `${BTF.PROTECTION.PAYROLL_TRANSFER_LOCK_PREFIX}_${monthLabel}_R${block.start}_R${block.end}_C${col}`
+      );
+      protection.setWarningOnly(false);
+
+      try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+      try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+    }
+  }
+}
+
+function btfBuildContinuousRowBlocks_(rows) {
+  const uniqueRows = Array.from(new Set(rows))
+    .map(Number)
+    .filter(n => n > 0)
+    .sort((a, b) => a - b);
+
+  const blocks = [];
+  if (!uniqueRows.length) return blocks;
+
+  let start = uniqueRows[0];
+  let end   = uniqueRows[0];
+
+  for (let i = 1; i < uniqueRows.length; i++) {
+    const r = uniqueRows[i];
+
+    if (r === end + 1) {
+      end = r;
+    } else {
+      blocks.push({ start: start, end: end });
+      start = r;
+      end   = r;
+    }
+  }
+
+  blocks.push({ start: start, end: end });
+  return blocks;
+}
+
+
+/* =========================================================
+   BANK FILE PROTECTION
+========================================================= */
+
+function btfRemoveBankFileProtections_(ss) {
+  const protections = ss.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+    .concat(ss.getProtections(SpreadsheetApp.ProtectionType.RANGE));
+
+  protections.forEach(p => {
+    const desc = String(p.getDescription() || '');
+
+    if (desc.indexOf(BTF.PROTECTION.BANK_FILE_PROTECTION_PREFIX) === 0) {
+      try { p.remove(); } catch (_) {}
+    }
+  });
+}
+
+function btfRestoreBankFileProtections_(ss) {
+  const sheets = [
+    ss.getSheetByName(BTF.SHEETS.UNION_BANK),
+    ss.getSheetByName(BTF.SHEETS.OTHER_BANKS),
+  ].filter(Boolean);
+
+  sheets.forEach(sh => {
+    const protection = sh.protect();
+
+    protection.setDescription(
+      `${BTF.PROTECTION.BANK_FILE_PROTECTION_PREFIX}_${sh.getName()}`
+    );
+    protection.setWarningOnly(false);
+
+    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+  });
+}
+
+
+/* =========================================================
+   META DATA
+========================================================= */
+
+function btfGetMetaValue_(metaSh, key) {
+  const lastRow = metaSh.getLastRow();
+  if (lastRow < 1) return '';
+
+  const values = metaSh.getRange(1, 1, lastRow, 2).getDisplayValues();
+
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || '').trim() === String(key).trim()) {
+      return values[i][1];
+    }
+  }
+
+  return '';
+}
+
+function btfSetMetaValue_(metaSh, key, value) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(key).trim();
+
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setValue(value);
+        return;
+      }
+    }
+  }
+
+  metaSh.appendRow([keyText, value]);
+}
+
+function btfSetMetaHyperlink_(metaSh, key, spreadsheetId) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(key).trim();
+  const formula = `=HYPERLINK("https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit","${spreadsheetId}")`;
+
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setFormula(formula);
+        return;
+      }
+    }
+  }
+
+  metaSh.appendRow([keyText, '']);
+  metaSh.getRange(metaSh.getLastRow(), 2).setFormula(formula);
+}
+
+
+/* =========================================================
+   PAYROLL CONTROL CENTER
+========================================================= */
+
+function btfUpdatePayrollControlCenter_(args) {
+  const ccSS = SpreadsheetApp.openById(CONST.SOURCES.PAYROLL_CONTROL_CENTER_SS_ID);
+  const ccSh = ccSS.getSheetByName(CONST.TABS.PAYROLL_CONTROL_CENTER);
+
+  if (!ccSh) throw new Error(`Payroll Control Center tab not found: ${CONST.TABS.PAYROLL_CONTROL_CENTER}`);
+
+  const lastRow = ccSh.getLastRow();
+  const lastCol = ccSh.getLastColumn();
+
+  if (lastRow < 2 || lastCol < 1) {
+    throw new Error('Payroll Control Center is empty.');
+  }
+
+  const headers = ccSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = btfBuildHeaderIndex_(headers);
+
+  const keyCol          = btfRequireHeader_(idx, CONST.CONTROL_CENTER_HEADERS.PAYROLL_MONTH_KEY, CONST.TABS.PAYROLL_CONTROL_CENTER);
+  const monthCol        = btfRequireHeader_(idx, CONST.CONTROL_CENTER_HEADERS.MONTH, CONST.TABS.PAYROLL_CONTROL_CENTER);
+  const yearCol         = btfRequireHeader_(idx, CONST.CONTROL_CENTER_HEADERS.YEAR, CONST.TABS.PAYROLL_CONTROL_CENTER);
+  const bankFileNameCol = btfRequireHeader_(idx, CONST.CONTROL_CENTER_HEADERS.BANK_TRANSFER_FILE_NAME, CONST.TABS.PAYROLL_CONTROL_CENTER);
+  const bankFileIdCol   = btfRequireHeader_(idx, CONST.CONTROL_CENTER_HEADERS.BANK_TRANSFER_FILE_ID, CONST.TABS.PAYROLL_CONTROL_CENTER);
+
+  const data = ccSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  const targetMonthLabel = btfNorm_(args.monthLabel);
+  let targetRow = -1;
+
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+
+    const monthKey         = btfNorm_(row[keyCol]);
+    const composedMonthKey = btfNorm_(`${row[monthCol]}_${row[yearCol]}`);
+
+    if (monthKey === targetMonthLabel || composedMonthKey === targetMonthLabel) {
+      targetRow = i + 2;
+      break;
+    }
+  }
+
+  if (targetRow === -1) {
+    throw new Error(`Payroll Control Center row not found for ${args.monthLabel}.`);
+  }
+
+  ccSh.getRange(targetRow, bankFileNameCol + 1).setValue(args.bankTransferFileName);
+  ccSh.getRange(targetRow, bankFileIdCol + 1)
+    .setFormula(`=HYPERLINK("https://docs.google.com/spreadsheets/d/${args.bankTransferFileId}/edit","${args.bankTransferFileId}")`);
+
+  btfProtectControlCenterCells_(ccSh, targetRow, [
+    bankFileNameCol + 1,
+    bankFileIdCol + 1,
+  ], args.monthLabel);
+}
+
+function btfProtectControlCenterCells_(sh, row, cols1Based, monthLabel) {
+  if (!cols1Based || !cols1Based.length) return;
+
+  for (let i = 0; i < cols1Based.length; i++) {
+    const col        = cols1Based[i];
+    const protection = sh.getRange(row, col).protect();
+
+    protection.setDescription(
+      `${BTF.PROTECTION.CONTROL_LOCK_PREFIX}_${monthLabel}_R${row}_C${col}`
+    );
+    protection.setWarningOnly(false);
+
+    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+  }
+}
+
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function btfBuildHeaderIndex_(headers) {
+  const idx = {};
+
+  headers.forEach((h, i) => {
+    const key = btfNorm_(h);
+    if (key && idx[key] === undefined) {
+      idx[key] = i;
+    }
+  });
+
+  return idx;
+}
+
+function btfRequireHeader_(idx, headerName, sheetName) {
+  const key = btfNorm_(headerName);
+
+  if (idx[key] === undefined) {
+    throw new Error(`Missing required header "${headerName}" in sheet "${sheetName}".`);
+  }
+
+  return idx[key];
+}
+
+function btfNorm_(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function btfToNumber_(value) {
+  if (value === null || value === undefined || value === '') return 0;
+
+  const n = Number(String(value).replace(/,/g, '').trim());
+
+  return isNaN(n) ? 0 : n;
+}
+
+function btfExtractSpreadsheetId_(value) {
+  const text = String(value || '').trim();
+
+  if (!text) return '';
+
+  const match = text.match(/[-\w]{25,}/);
+  return match ? match[0] : '';
+}

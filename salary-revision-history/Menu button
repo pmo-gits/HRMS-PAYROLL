@@ -1,0 +1,32 @@
+/**
+ * FULL MENU SCRIPT (updated)
+ *
+ * Two SEPARATE top-level menu buttons (not nested under "Salary Revision"):
+ * 1) Submit for Approval  -> calls submitForApproval()
+ * 2) Revision Approval    -> calls revisionApproval()
+ *
+ * IMPORTANT:
+ * - If you already have an onOpen() elsewhere in this Apps Script project,
+ *   DO NOT create another onOpen().
+ *   In that case, copy ONLY addHrPayrollMenus_() and call it inside your existing onOpen().
+ */
+
+// Use this ONLY if there is no other onOpen() in your project
+function onOpen(e) {
+  addHrPayrollMenus_();
+}
+
+// Safe helper: can be called from an existing onOpen() without side effects
+function addHrPayrollMenus_() {
+  const ui = SpreadsheetApp.getUi();
+
+  // Menu 1: Submit for Approval (top-level)
+  ui.createMenu('Submit for Approval')
+    .addItem('Run', 'submitForApproval')
+    .addToUi();
+
+  // Menu 2: Revision Approval (top-level)
+  ui.createMenu('Revision Approval')
+    .addItem('Run', 'revisionApproval')
+    .addToUi();
+}

@@ -1,0 +1,940 @@
+/*******************************************************
+ * GENERATE LOCKED PAYROLL
+ *******************************************************/
+
+const GLP_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbyhAADy_VUoTuWt8QlLGR5B6I5ckJf67FM456CRxHspRmhluFEZikksIXGRB3pkECK5/exec';
+const GLP_OWNER_EMAIL = 'pmo@butlerleather.com';
+const GLP_ALLOWED_EMAIL = 'nazneen@butlerleather.com';
+
+function generateLockedPayroll() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    // ── Owner: run directly ──
+    if (currentUser === GLP_OWNER_EMAIL.toLowerCase()) {
+      generateLockedPayrollServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      return;
+    }
+
+    // ── Allowed user: call Web App (runs as owner) ──
+    if (currentUser === GLP_ALLOWED_EMAIL.toLowerCase()) {
+      if (!GLP_WEBAPP_URL || GLP_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert(
+          'Generate Locked Payroll',
+          'Web App URL is not configured. Please deploy the Web App and paste the URL in GLP_WEBAPP_URL.',
+          ui.ButtonSet.OK
+        );
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(GLP_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'generateLockedPayroll',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      if (result.message) {
+        ui.alert('Generate Locked Payroll', result.message, ui.ButtonSet.OK);
+      }
+      return;
+    }
+
+    // ── Anyone else: blocked ──
+    ui.alert(
+      'Generate Locked Payroll',
+      'You are not authorized to run this function.',
+      ui.ButtonSet.OK
+    );
+
+  } catch (err) {
+    ui.alert(
+      'Generate Locked Payroll',
+      `Error: ${err && err.message ? err.message : err}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/* =========================================================
+   WEB APP ENTRY POINT
+   (Single doPost — routes all actions across all scripts)
+
+   NOTE: the 'exportPayslipPdfs' branch that used to be here has
+   been removed — exportPayslipPdfsServer_() no longer exists in
+   PAYROLL_GEN_10 (PDF export was dropped entirely per PMO), so
+   this branch would have thrown "function not defined" if ever
+   called. Everything else below is unchanged.
+========================================================= */
+
+function doPost(e) {
+  try {
+    const payload = JSON.parse((e.postData && e.postData.contents) || '{}');
+    const action  = String(payload.action || '').trim();
+
+    let result;
+
+    if (action === 'generateLockedPayroll') {
+      result = generateLockedPayrollServer_(payload);
+    } else if (action === 'getPayrollData') {
+      result = getPayrollDataServer_(payload);
+    } else if (action === 'validateAttendance') {
+      result = validateAttendanceServer_(payload);
+    } else if (action === 'validatePayroll') {
+      result = validatePayrollServer_(payload);
+    } else if (action === 'generateBankTransferFile') {
+      result = generateBankTransferFileServer_(payload);
+    } else if (action === 'generatePayslips') {
+      result = generatePayslipsServer_(payload);
+    } else {
+      result = { success: false, message: `Unknown action: "${action}".` };
+    }
+
+    return ContentService
+      .createTextOutput(JSON.stringify(result))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: false,
+        message: `Error: ${err && err.message ? err.message : err}`,
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function generateLockedPayrollServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  const userEmail = String(payload.requestedBy || '').trim();
+  const runMode = String(payload.runMode || 'webapp').trim();
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  let createdLockedFile = null;
+  let ss, ui;
+
+  try {
+    ss = SpreadsheetApp.openById(spreadsheetId);
+
+    // ui is only available in direct (owner) mode
+    if (runMode === 'direct') {
+      try { ui = SpreadsheetApp.getUi(); } catch (_) { ui = null; }
+    }
+
+    const tz = Session.getScriptTimeZone();
+    const now = new Date();
+    const nowText = Utilities.formatDate(now, tz, 'yyyy-MM-dd HH:mm:ss');
+
+    const fileName = ss.getName();
+    const monthInfo = parsePayrollMonthFromName_(fileName);
+    if (!monthInfo) {
+      return {
+        success: false,
+        message:
+          `Cannot parse payroll month from file name: "${fileName}". ` +
+          `Expected like "Payroll-Workings_January_2026".`,
+      };
+    }
+
+    const monthLabel = monthInfo.monthLabel;
+    const lockedFileName = `${CONST.LOCK_RULES.LOCKED_FILE_PREFIX}_${monthLabel}`;
+
+    const meta = ss.getSheetByName(CONST.TABS.META_DATA);
+    if (!meta) {
+      return { success: false, message: `Missing required tab: ${CONST.TABS.META_DATA}` };
+    }
+
+    const lockStatus = String(glpGetMetaValueExactKey_(meta, 'LOCK_STATUS') || '').trim().toUpperCase();
+    if (lockStatus === CONST.VALUES.LOCK_STATUS_LOCKED) {
+      return { success: false, message: 'Skipped: Payroll is already LOCKED.' };
+    }
+
+    const attendanceValidation = String(getMetaValue_(meta, CONST.META_KEYS.ATTENDANCE_VALIDATION) || '').trim().toUpperCase();
+    if (!attendanceValidation.includes('VALIDATED')) {
+      return { success: false, message: 'Run "Validate Attendance" first.' };
+    }
+
+    const storedMonthLabel = String(getMetaValue_(meta, CONST.META_KEYS.PAYROLL_MONTH_LABEL) || '').trim();
+    if (!storedMonthLabel || norm_(storedMonthLabel) !== norm_(monthLabel)) {
+      return {
+        success: false,
+        message: `Month mismatch. Re-run "Validate Attendance". (Expected ${monthLabel})`,
+      };
+    }
+
+    const attendanceLinkOrId = String(getMetaValue_(meta, CONST.META_KEYS.ATTENDANCE_FILE_ID) || '').trim();
+    if (!attendanceLinkOrId) {
+      return { success: false, message: 'Missing ATTENDANCE_FILE_ID in META_DATA. Re-run "Validate Attendance".' };
+    }
+
+    const attendanceFileId = extractSpreadsheetId_(attendanceLinkOrId);
+    if (!attendanceFileId) {
+      return { success: false, message: 'ATTENDANCE_FILE_ID in META_DATA is not a valid file link/ID.' };
+    }
+
+    const existingLockedFileId = String(glpGetMetaValueExactKey_(meta, 'LOCKED_FILE_ID') || '').trim();
+    if (existingLockedFileId) {
+      return { success: false, message: 'LOCKED_FILE_ID already exists in META_DATA. Duplicate lock blocked.' };
+    }
+
+    const payrollSh = ss.getSheetByName(CONST.TEMPLATES.PAYROLL_TAB_NAME);
+    if (!payrollSh) {
+      return { success: false, message: `Missing required tab: ${CONST.TEMPLATES.PAYROLL_TAB_NAME}` };
+    }
+
+    const payrollLastRow = payrollSh.getLastRow();
+    const payrollLastCol = payrollSh.getLastColumn();
+    if (payrollLastRow < 2 || payrollLastCol < 1) {
+      return { success: false, message: `${CONST.TEMPLATES.PAYROLL_TAB_NAME} is empty.` };
+    }
+
+    const payrollHeaders = payrollSh.getRange(1, 1, 1, payrollLastCol).getDisplayValues()[0];
+    const payrollIdx = buildHeaderIndex_(payrollHeaders);
+
+    glpRequireHeaderIndex_(payrollIdx, CONST.KEYS.PAYROLL, CONST.TEMPLATES.PAYROLL_TAB_NAME);
+    glpRequireHeaderIndex_(payrollIdx, 'Advance Deduction', CONST.TEMPLATES.PAYROLL_TAB_NAME);
+    const payrollReleaseConfirmationCol = glpRequireHeaderIndex_(payrollIdx, 'Payroll Release Confirmation', CONST.TEMPLATES.PAYROLL_TAB_NAME) + 1;
+    const bankTransferMarkDownCol = glpRequireHeaderIndex_(payrollIdx, 'Bank Transfer Mark Down', CONST.TEMPLATES.PAYROLL_TAB_NAME) + 1;
+
+    const attendanceSS = SpreadsheetApp.openById(attendanceFileId);
+    const attendanceEntrySh = attendanceSS.getSheetByName(CONST.TABS.ATTENDANCE_ENTRY);
+    const salaryAdvanceSh = attendanceSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+
+    if (!attendanceEntrySh) {
+      return { success: false, message: `Attendance tab not found: ${CONST.TABS.ATTENDANCE_ENTRY}` };
+    }
+    if (!salaryAdvanceSh) {
+      return { success: false, message: `Attendance tab not found: ${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS}` };
+    }
+
+    glpAssertAttendanceEntryLocked_(attendanceEntrySh);
+    glpAssertSalaryAdvancePayrollNotLocked_(salaryAdvanceSh);
+
+    try {
+      glpAssertAdvanceDeductionTotalMatchesPlannedEmi_(meta, salaryAdvanceSh);
+      glpAssertNegativeBalanceEmployeesCleared_(meta);               // ── NEW PRECHECK ──
+      glpAssertMetaGrossTotalPayrollMatchesSalaryMaster_(meta);
+    } catch (err) {
+      return { success: false, message: err.message };
+    }
+
+    const preparedAttendanceUpdate = glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, nowText);
+    const preparedPayrollControlUpdate = glpPreparePayrollControlCenterUpdatePayload_({
+      monthLabel: monthLabel,
+      attendanceFileId: attendanceFileId,
+      lockedFileName: lockedFileName,
+      lockedFileId: null,
+      lockedOn: nowText,
+      lockedBy: userEmail,
+    });
+    const preparedMetaUpdate = glpPrepareMetaUpdatePayload_(meta);
+
+    const lockedFolder = DriveApp.getFolderById(CONST.FOLDERS.LOCKED_PAYROLL_FILES);
+
+    const existingLocked = lockedFolder.getFilesByName(lockedFileName);
+    if (existingLocked.hasNext()) {
+      return { success: false, message: `Locked payroll file already exists: ${lockedFileName}` };
+    }
+
+    createdLockedFile = DriveApp.getFileById(ss.getId()).makeCopy(lockedFileName, lockedFolder);
+    const lockedFileId = createdLockedFile.getId();
+    const lockedSS = SpreadsheetApp.openById(lockedFileId);
+
+    glpConvertSpreadsheetToValues_(lockedSS);
+    glpSecureLockedPayrollFile_(lockedSS, createdLockedFile);
+
+    const lockedFileUrl = glpBuildSpreadsheetUrl_(lockedFileId);
+    const attendanceFileUrl = glpBuildSpreadsheetUrl_(attendanceFileId);
+
+    preparedPayrollControlUpdate.updatesByHeader[CONST.CONTROL_CENTER_HEADERS.LOCKED_ATTENDANCE_FILE_ID] = attendanceFileUrl;
+    preparedPayrollControlUpdate.updatesByHeader[CONST.CONTROL_CENTER_HEADERS.LOCKED_PAYROLL_FILE_NAME] = lockedFileName;
+    preparedPayrollControlUpdate.updatesByHeader[CONST.CONTROL_CENTER_HEADERS.LOCKED_PAYROLL_FILE_ID] = lockedFileUrl;
+    preparedPayrollControlUpdate.updatesByHeader[CONST.CONTROL_CENTER_HEADERS.LOCK_STATUS] = CONST.VALUES.LOCK_STATUS_LOCKED;
+    preparedPayrollControlUpdate.updatesByHeader[CONST.CONTROL_CENTER_HEADERS.LOCKED_ON] = nowText;
+    preparedPayrollControlUpdate.updatesByHeader[CONST.CONTROL_CENTER_HEADERS.LOCKED_BY] = userEmail;
+
+    preparedMetaUpdate.updatesByKey['LOCK_STATUS'] = CONST.VALUES.LOCK_STATUS_LOCKED;
+    preparedMetaUpdate.updatesByKey['LOCKED_FILE_ID'] = lockedFileUrl;
+    preparedMetaUpdate.updatesByKey['LOCKED_ON'] = nowText;
+    preparedMetaUpdate.updatesByKey['LOCKED_BY'] = userEmail;
+
+    try {
+      glpApplySalaryAdvanceUpdatePayload_(salaryAdvanceSh, preparedAttendanceUpdate);
+      SpreadsheetApp.flush();
+
+      glpPushRecoveredLedgerSnapshot_(attendanceSS);
+      glpPushLeaveLedgerSnapshotAndUpdateBalances_(attendanceSS);
+      SpreadsheetApp.flush();
+
+    } catch (salaryAdvanceWriteErr) {
+      try { glpRollbackSalaryAdvanceUpdatePayload_(salaryAdvanceSh, preparedAttendanceUpdate); } catch (_) {}
+      SpreadsheetApp.flush();
+      throw salaryAdvanceWriteErr;
+    }
+
+    // ── PROTECTION: Attendance file (whole sheet, fast) ──
+    glpProtectEntireSpreadsheet_(attendanceSS, {
+      descriptionPrefix: `ATTENDANCE_LOCKED_${monthLabel}`,
+      unprotectedRangesBySheetId: {},
+      editorsToKeep: [],
+      preserveExistingEditors: false,
+    });
+
+    // ── PROTECTION: Payroll-Workings file
+    //    Whole sheet on all tabs EXCEPT PAY_ROLL tab which keeps
+    //    Payroll Release Confirmation and Bank Transfer Mark Down columns editable ──
+    glpProtectWorkingsFileExceptReleaseAndBankMarkDownColumns_(
+      ss,
+      payrollSh,
+      payrollReleaseConfirmationCol,
+      bankTransferMarkDownCol,
+      monthLabel
+    );
+
+    SpreadsheetApp.flush();
+
+    glpApplyPayrollControlCenterUpdatePayload_(preparedPayrollControlUpdate);
+    glpApplyMetaUpdatePayload_(preparedMetaUpdate);
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      message: `Locked payroll created successfully for ${monthLabel}.`,
+    };
+
+  } catch (err) {
+    if (createdLockedFile) {
+      try { createdLockedFile.setTrashed(true); } catch (_) {}
+    }
+    return {
+      success: false,
+      message: `Error: ${err && err.message ? err.message : err}`,
+    };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/* =========================================================
+   ATTENDANCE PRECHECKS
+   — UNCHANGED —
+========================================================= */
+
+function glpAssertAttendanceEntryLocked_(attendanceEntrySh) {
+  const lastRow = attendanceEntrySh.getLastRow();
+  const lastCol = attendanceEntrySh.getLastColumn();
+
+  if (lastRow < 2 || lastCol < 1) {
+    throw new Error(`${CONST.TABS.ATTENDANCE_ENTRY} is empty.`);
+  }
+
+  const headers = attendanceEntrySh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const lockedStatusCol = glpRequireHeaderIndex_(idx, 'LOCKED STATUS', CONST.TABS.ATTENDANCE_ENTRY) + 1;
+  const values = attendanceEntrySh.getRange(2, lockedStatusCol, lastRow - 1, 1).getDisplayValues();
+
+  const anyLocked = values.some(r => String(r[0] || '').trim().toUpperCase().includes('LOCKED'));
+  if (!anyLocked) {
+    throw new Error('Attendance entry is not locked. Lock attendance first, then generate locked payroll.');
+  }
+}
+
+function glpAssertSalaryAdvancePayrollNotLocked_(salaryAdvanceSh) {
+  const lastRow = salaryAdvanceSh.getLastRow();
+  const lastCol = salaryAdvanceSh.getLastColumn();
+
+  if (lastRow < 2 || lastCol < 1) return;
+
+  const headers = salaryAdvanceSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const payrollStatusCol = glpRequireHeaderIndex_(idx, 'Payroll Status', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS) + 1;
+  const values = salaryAdvanceSh.getRange(2, payrollStatusCol, lastRow - 1, 1).getDisplayValues();
+
+  for (let i = 0; i < values.length; i++) {
+    const v = String(values[i][0] || '').trim().toUpperCase();
+    if (v === CONST.VALUES.LOCK_STATUS_LOCKED) {
+      throw new Error('Salary Advance deductions already has Payroll Status = LOCKED. Duplicate payroll lock blocked.');
+    }
+  }
+}
+
+function glpAssertAdvanceDeductionTotalMatchesPlannedEmi_(metaSh, salaryAdvanceSh) {
+  const metaTotal = glpGetMetaCheckValue_(metaSh, 'Advance Deduction Total', 'Payroll Status');
+  const attendanceTotal = glpGetSalaryAdvancePlannedEmiTotal_(salaryAdvanceSh);
+
+  const metaNum = glpToNumber_(metaTotal);
+  const attendanceNum = glpToNumber_(attendanceTotal);
+
+  if (Math.abs(metaNum - attendanceNum) > 0.0001) {
+    throw new Error(
+      `Advance Deduction Total mismatch. META_DATA = ${metaNum}, ` +
+      `Salary Advance deductions Planned EMI total = ${attendanceNum}. ` +
+      `Lock process stopped.`
+    );
+  }
+}
+
+/* =========================================================
+   NEW PRECHECK: NEGATIVE BALANCE EMPLOYEES
+========================================================= */
+
+function glpAssertNegativeBalanceEmployeesCleared_(metaSh) {
+  const checkLabel = 'Employees with Negative Balance After Advance Deduction';
+  const row = glpGetMetaCheckRowByLabel_(metaSh, checkLabel);
+
+  const payrollStatus    = String(row['Payroll Status']      || '').trim();
+  const salaryMasterStatus = String(row['Salary Master Status'] || '').trim().toUpperCase();
+
+  // Blank = formula returned "" = no negative balance employees → pass
+  if (!payrollStatus) return;
+
+  // Non-blank = one or more employees have negative balance → check HR decision
+  if (salaryMasterStatus !== 'PROCEED') {
+    throw new Error(
+      'Negative net pay detected. Check Attendance and update HR Decision.'
+    );
+  }
+}
+
+/* =========================================================
+   META CHECK HELPERS
+   — UNCHANGED —
+========================================================= */
+
+function glpAssertMetaGrossTotalPayrollMatchesSalaryMaster_(metaSh) {
+  const grossRow = glpGetMetaCheckRowByLabel_(metaSh, 'Gross Total');
+
+  const payrollStatus = grossRow['Payroll Status'];
+  const salaryMasterStatus = grossRow['Salary Master Status'];
+
+  const payrollNum = glpToNumber_(payrollStatus);
+  const salaryMasterNum = glpToNumber_(salaryMasterStatus);
+
+  if (Math.abs(payrollNum - salaryMasterNum) > 0.0001) {
+    throw new Error(
+      `Gross Total mismatch. META_DATA Payroll Status = ${payrollNum}, ` +
+      `Salary Master Status = ${salaryMasterNum}. ` +
+      `Lock process stopped.`
+    );
+  }
+}
+
+function glpGetMetaCheckValue_(metaSh, checkLabel, targetHeaderName) {
+  const rowMap = glpGetMetaCheckRowByLabel_(metaSh, checkLabel);
+  const headerName = String(targetHeaderName || 'Payroll Status').trim();
+
+  if (!(headerName in rowMap)) {
+    throw new Error(`META_DATA header not found: "${headerName}".`);
+  }
+
+  return rowMap[headerName];
+}
+
+function glpGetMetaCheckRowByLabel_(metaSh, checkLabel) {
+  const lastRow = metaSh.getLastRow();
+  const lastCol = metaSh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) {
+    throw new Error(`${CONST.TABS.META_DATA} is empty.`);
+  }
+
+  const headers = metaSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const checkCol = glpRequireHeaderIndex_(idx, 'Check', CONST.TABS.META_DATA) + 1;
+  const data = metaSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  for (let i = 0; i < data.length; i++) {
+    const label = String(data[i][checkCol - 1] || '').trim();
+    if (label === String(checkLabel).trim()) {
+      return glpMapMetaRowByHeaders_(headers, data[i]);
+    }
+  }
+
+  throw new Error(`META_DATA row not found where Check = "${checkLabel}".`);
+}
+
+function glpMapMetaRowByHeaders_(headers, rowValues) {
+  const out = {};
+  for (let i = 0; i < headers.length; i++) {
+    const headerText = String(headers[i] || '').trim();
+    if (!headerText) continue;
+    out[headerText] = rowValues[i];
+  }
+  return out;
+}
+
+function glpGetSalaryAdvancePlannedEmiTotal_(salaryAdvanceSh) {
+  const lastRow = salaryAdvanceSh.getLastRow();
+  const lastCol = salaryAdvanceSh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return 0;
+
+  const headers = salaryAdvanceSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+  const plannedEmiCol = glpRequireHeaderIndex_(idx, 'Planned EMI', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS) + 1;
+
+  const values = salaryAdvanceSh.getRange(2, plannedEmiCol, lastRow - 1, 1).getDisplayValues();
+  let total = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    total += glpToNumber_(values[i][0]);
+  }
+
+  return total;
+}
+
+function glpToNumber_(value) {
+  const s = String(value == null ? '' : value)
+    .replace(/[₹,\s]/g, '')
+    .trim();
+  if (!s) return 0;
+  const n = Number(s);
+  return isNaN(n) ? 0 : n;
+}
+
+/* =========================================================
+   PREPARE / APPLY ATTENDANCE UPDATE
+   — UNCHANGED —
+========================================================= */
+
+function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, lockedOnText) {
+  const payLastRow = payrollSh.getLastRow();
+  const payLastCol = payrollSh.getLastColumn();
+  const saLastRow = salaryAdvanceSh.getLastRow();
+  const saLastCol = salaryAdvanceSh.getLastColumn();
+
+  if (payLastRow < 2) throw new Error(`${CONST.TEMPLATES.PAYROLL_TAB_NAME} has no employee rows.`);
+  if (saLastCol < 1) throw new Error(`${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS} is empty.`);
+
+  const payHeaders = payrollSh.getRange(1, 1, 1, payLastCol).getDisplayValues()[0];
+  const payIdx = buildHeaderIndex_(payHeaders);
+
+  const saHeaders = salaryAdvanceSh.getRange(1, 1, 1, saLastCol).getDisplayValues()[0];
+  const saIdx = buildHeaderIndex_(saHeaders);
+
+  const payEmpIdx0 = glpRequireHeaderIndex_(payIdx, CONST.KEYS.PAYROLL, CONST.TEMPLATES.PAYROLL_TAB_NAME);
+  const payAdvIdx0 = glpRequireHeaderIndex_(payIdx, 'Advance Deduction', CONST.TEMPLATES.PAYROLL_TAB_NAME);
+
+  const saEmpIdx0 = glpRequireHeaderIndex_(saIdx, CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.SALARY_ADVANCE_DEDUCTIONS], CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const saRecoveredIdx0 = glpRequireHeaderIndex_(saIdx, 'Recovered Amount', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const saPayrollStatusIdx0 = glpRequireHeaderIndex_(saIdx, 'Payroll Status', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+
+  const payrollData = payrollSh.getRange(2, 1, payLastRow - 1, payLastCol).getDisplayValues();
+  const salaryAdvanceData = saLastRow >= 2
+    ? salaryAdvanceSh.getRange(2, 1, saLastRow - 1, saLastCol).getDisplayValues()
+    : [];
+
+  const hasAnySalaryAdvanceEmployeeCode = salaryAdvanceData.some(row =>
+    String(row[saEmpIdx0] || '').trim()
+  );
+
+  if (!hasAnySalaryAdvanceEmployeeCode) {
+    return {
+      noEmployeeCodeMode: true,
+      lockMarkerCellA1: 'J2',
+      lockMarkerValue: `${CONST.VALUES.LOCK_STATUS_LOCKED} | ${lockedOnText || ''}`.trim(),
+      originalLockMarkerValue: salaryAdvanceSh.getRange('J2').getValue(),
+      rowCount: 1,
+    };
+  }
+
+  const advanceByEmp = new Map();
+  for (let i = 0; i < payrollData.length; i++) {
+    const empCode = String(payrollData[i][payEmpIdx0] || '').trim();
+    if (!empCode) continue;
+    advanceByEmp.set(empCode, payrollData[i][payAdvIdx0]);
+  }
+
+  const recoveredValues          = [];
+  const payrollStatusValues      = [];
+  const originalRecoveredValues  = [];
+  const originalPayrollStatusValues = [];
+
+  for (let i = 0; i < salaryAdvanceData.length; i++) {
+    const empCode            = String(salaryAdvanceData[i][saEmpIdx0] || '').trim();
+    const existingRecovered  = salaryAdvanceData[i][saRecoveredIdx0];
+    const existingPayrollStatus = salaryAdvanceData[i][saPayrollStatusIdx0];
+
+    originalRecoveredValues.push([existingRecovered]);
+    originalPayrollStatusValues.push([existingPayrollStatus]);
+
+    if (!empCode) {
+      recoveredValues.push(['']);
+      payrollStatusValues.push(['']);
+      continue;
+    }
+
+    recoveredValues.push([advanceByEmp.has(empCode) ? advanceByEmp.get(empCode) : '']);
+    payrollStatusValues.push([CONST.VALUES.LOCK_STATUS_LOCKED]);
+  }
+
+  return {
+    noEmployeeCodeMode: false,
+    recoveredColumn: saRecoveredIdx0 + 1,
+    payrollStatusColumn: saPayrollStatusIdx0 + 1,
+    recoveredValues,
+    payrollStatusValues,
+    originalRecoveredValues,
+    originalPayrollStatusValues,
+    rowCount: salaryAdvanceData.length,
+  };
+}
+
+function glpApplySalaryAdvanceUpdatePayload_(salaryAdvanceSh, payload) {
+  if (!payload || !payload.rowCount) return;
+
+  if (payload.noEmployeeCodeMode) {
+    salaryAdvanceSh.getRange(payload.lockMarkerCellA1 || 'J2').setValue(payload.lockMarkerValue || CONST.VALUES.LOCK_STATUS_LOCKED);
+    return;
+  }
+
+  salaryAdvanceSh.getRange(2, payload.recoveredColumn, payload.rowCount, 1).setValues(payload.recoveredValues);
+  salaryAdvanceSh.getRange(2, payload.payrollStatusColumn, payload.rowCount, 1).setValues(payload.payrollStatusValues);
+}
+
+function glpRollbackSalaryAdvanceUpdatePayload_(salaryAdvanceSh, payload) {
+  if (!payload || !payload.rowCount) return;
+
+  if (payload.noEmployeeCodeMode) {
+    salaryAdvanceSh.getRange(payload.lockMarkerCellA1 || 'J2').setValue(payload.originalLockMarkerValue || '');
+    return;
+  }
+
+  salaryAdvanceSh.getRange(2, payload.recoveredColumn, payload.rowCount, 1).setValues(payload.originalRecoveredValues);
+  salaryAdvanceSh.getRange(2, payload.payrollStatusColumn, payload.rowCount, 1).setValues(payload.originalPayrollStatusValues);
+}
+
+/* =========================================================
+   LOCKED COPY CREATION
+   — UNCHANGED —
+========================================================= */
+
+function glpConvertSpreadsheetToValues_(ss) {
+  const sheets = ss.getSheets();
+
+  for (let i = 0; i < sheets.length; i++) {
+    const sh = sheets[i];
+    const lastRow = sh.getLastRow();
+    const lastCol = sh.getLastColumn();
+    if (lastRow < 1 || lastCol < 1) continue;
+
+    const rg = sh.getRange(1, 1, lastRow, lastCol);
+    rg.copyTo(rg, { contentsOnly: true });
+  }
+
+  SpreadsheetApp.flush();
+}
+
+function glpSecureLockedPayrollFile_(lockedSS, lockedFile) {
+  try {
+    if (CONST.LOCK_RULES.OWNER_EMAIL) {
+      lockedFile.setOwner(CONST.LOCK_RULES.OWNER_EMAIL);
+    }
+  } catch (_) {}
+
+  try {
+    if (CONST.LOCK_RULES.VIEWER_EMAILS && CONST.LOCK_RULES.VIEWER_EMAILS.length) {
+      lockedFile.addViewers(CONST.LOCK_RULES.VIEWER_EMAILS);
+    }
+  } catch (_) {}
+
+  try {
+    const editors = lockedFile.getEditors();
+    editors.forEach(ed => {
+      const email = ed && ed.getEmail ? ed.getEmail() : '';
+      if (email && email !== CONST.LOCK_RULES.OWNER_EMAIL) {
+        try { lockedFile.removeEditor(ed); } catch (_) {}
+      }
+    });
+  } catch (_) {}
+
+  glpProtectEntireSpreadsheet_(lockedSS, {
+    descriptionPrefix: 'LOCKED_PAYROLL_FILE',
+    unprotectedRangesBySheetId: {},
+    editorsToKeep: [CONST.LOCK_RULES.OWNER_EMAIL],
+    preserveExistingEditors: false,
+  });
+}
+
+/* =========================================================
+   META UPDATE
+   — UNCHANGED —
+========================================================= */
+
+function glpPrepareMetaUpdatePayload_(metaSh) {
+  return {
+    metaSh: metaSh,
+    updatesByKey: {},
+    originalValuesByKey: {
+      'LOCK_STATUS':    glpGetMetaValueExactKey_(metaSh, 'LOCK_STATUS'),
+      'LOCKED_FILE_ID': glpGetMetaValueExactKey_(metaSh, 'LOCKED_FILE_ID'),
+      'LOCKED_ON':      glpGetMetaValueExactKey_(metaSh, 'LOCKED_ON'),
+      'LOCKED_BY':      glpGetMetaValueExactKey_(metaSh, 'LOCKED_BY'),
+    },
+  };
+}
+
+function glpApplyMetaUpdatePayload_(payload) {
+  if (!payload || !payload.metaSh) return;
+
+  Object.keys(payload.updatesByKey || {}).forEach(key => {
+    glpSetMetaValueExactKey_(payload.metaSh, key, payload.updatesByKey[key]);
+  });
+}
+
+function glpRollbackMetaUpdatePayload_(payload) {
+  if (!payload || !payload.metaSh) return;
+
+  Object.keys(payload.originalValuesByKey || {}).forEach(key => {
+    glpSetMetaValueExactKey_(payload.metaSh, key, payload.originalValuesByKey[key]);
+  });
+}
+
+function glpGetMetaValueExactKey_(metaSh, exactKey) {
+  const lastRow = metaSh.getLastRow();
+  if (lastRow < 1) return '';
+
+  const data = metaSh.getRange(1, 1, lastRow, 2).getDisplayValues();
+  for (let i = 0; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === String(exactKey).trim()) {
+      return data[i][1];
+    }
+  }
+  return '';
+}
+
+function glpSetMetaValueExactKey_(metaSh, exactKey, value) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(exactKey).trim();
+
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setValue(value);
+        return;
+      }
+    }
+  }
+
+  metaSh.appendRow([keyText, value]);
+}
+
+/* =========================================================
+   PAYROLL CONTROL CENTER UPDATE
+   — UNCHANGED —
+========================================================= */
+
+function glpPreparePayrollControlCenterUpdatePayload_(args) {
+  const ccSS = SpreadsheetApp.openById(CONST.SOURCES.PAYROLL_CONTROL_CENTER_SS_ID);
+  const ccSh = ccSS.getSheetByName(CONST.TABS.PAYROLL_CONTROL_CENTER);
+  if (!ccSh) throw new Error(`Payroll Control Center tab not found: ${CONST.TABS.PAYROLL_CONTROL_CENTER}`);
+
+  const lastRow = ccSh.getLastRow();
+  const lastCol = ccSh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) {
+    throw new Error('Payroll Control Center is empty.');
+  }
+
+  const headers = ccSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const keyCol   = glpRequireHeaderIndex_(idx, CONST.CONTROL_CENTER_HEADERS.PAYROLL_MONTH_KEY, CONST.TABS.PAYROLL_CONTROL_CENTER);
+  const monthCol = glpRequireHeaderIndex_(idx, CONST.CONTROL_CENTER_HEADERS.MONTH, CONST.TABS.PAYROLL_CONTROL_CENTER);
+  const yearCol  = glpRequireHeaderIndex_(idx, CONST.CONTROL_CENTER_HEADERS.YEAR, CONST.TABS.PAYROLL_CONTROL_CENTER);
+
+  const data = ccSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+  const monthLabelNorm = norm_(args.monthLabel);
+  let targetRow = -1;
+
+  for (let i = 0; i < data.length; i++) {
+    const row            = data[i];
+    const rowMonthKey    = norm_(row[keyCol] || '');
+    const rowMonth       = String(row[monthCol] || '').trim();
+    const rowYear        = String(row[yearCol] || '').trim();
+    const composedMonthKey = norm_(`${rowMonth}_${rowYear}`);
+
+    if (rowMonthKey === monthLabelNorm || composedMonthKey === monthLabelNorm) {
+      targetRow = i + 2;
+      break;
+    }
+  }
+
+  if (targetRow === -1) {
+    throw new Error(`Payroll Control Center row not found for ${args.monthLabel}.`);
+  }
+
+  const targetHeaders = [
+    CONST.CONTROL_CENTER_HEADERS.LOCKED_ATTENDANCE_FILE_ID,
+    CONST.CONTROL_CENTER_HEADERS.LOCKED_PAYROLL_FILE_NAME,
+    CONST.CONTROL_CENTER_HEADERS.LOCKED_PAYROLL_FILE_ID,
+    CONST.CONTROL_CENTER_HEADERS.LOCK_STATUS,
+    CONST.CONTROL_CENTER_HEADERS.LOCKED_ON,
+    CONST.CONTROL_CENTER_HEADERS.LOCKED_BY,
+  ];
+
+  const originalValuesByHeader = {};
+  for (let i = 0; i < targetHeaders.length; i++) {
+    const header  = targetHeaders[i];
+    const colIdx0 = glpRequireHeaderIndex_(idx, header, CONST.TABS.PAYROLL_CONTROL_CENTER);
+    originalValuesByHeader[header] = ccSh.getRange(targetRow, colIdx0 + 1).getValue();
+  }
+
+  return {
+    ccSh,
+    row: targetRow,
+    monthLabel: args.monthLabel,
+    updatesByHeader: Object.assign({}, args.updatesByHeader || {}),
+    originalValuesByHeader,
+  };
+}
+
+function glpApplyPayrollControlCenterUpdatePayload_(payload) {
+  if (!payload || !payload.ccSh || !payload.row) return;
+
+  const ccSh    = payload.ccSh;
+  const row     = payload.row;
+  const headers = ccSh.getRange(1, 1, 1, ccSh.getLastColumn()).getDisplayValues()[0];
+  const idx     = buildHeaderIndex_(headers);
+
+  Object.keys(payload.updatesByHeader || {}).forEach(header => {
+    const colIdx0 = glpRequireHeaderIndex_(idx, header, CONST.TABS.PAYROLL_CONTROL_CENTER);
+    ccSh.getRange(row, colIdx0 + 1).setValue(payload.updatesByHeader[header]);
+  });
+
+  glpProtectPayrollControlCenterCells_(ccSh, row, Object.keys(payload.updatesByHeader || {}), payload.monthLabel || '');
+}
+
+function glpRollbackPayrollControlCenterUpdatePayload_(payload) {
+  if (!payload || !payload.ccSh || !payload.row) return;
+
+  const ccSh    = payload.ccSh;
+  const row     = payload.row;
+  const headers = ccSh.getRange(1, 1, 1, ccSh.getLastColumn()).getDisplayValues()[0];
+  const idx     = buildHeaderIndex_(headers);
+
+  Object.keys(payload.originalValuesByHeader || {}).forEach(header => {
+    const colIdx0 = glpRequireHeaderIndex_(idx, header, CONST.TABS.PAYROLL_CONTROL_CENTER);
+    ccSh.getRange(row, colIdx0 + 1).setValue(payload.originalValuesByHeader[header]);
+  });
+}
+
+function glpProtectPayrollControlCenterCells_(ccSh, row, headerNames, monthLabel) {
+  if (!headerNames || !headerNames.length) return;
+
+  const headers = ccSh.getRange(1, 1, 1, ccSh.getLastColumn()).getDisplayValues()[0];
+  const idx     = buildHeaderIndex_(headers);
+
+  for (let i = 0; i < headerNames.length; i++) {
+    const header  = headerNames[i];
+    const colIdx0 = glpRequireHeaderIndex_(idx, header, CONST.TABS.PAYROLL_CONTROL_CENTER);
+    const protection = ccSh.getRange(row, colIdx0 + 1).protect();
+    protection.setDescription(`PAYROLL_CONTROL_LOCK_${monthLabel || 'ROW'}__${header}`);
+    protection.setWarningOnly(false);
+
+    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+  }
+}
+
+/* =========================================================
+   PROTECTIONS
+   — UNCHANGED —
+========================================================= */
+
+function glpProtectEntireSpreadsheet_(ss, options) {
+  const sheets = ss.getSheets();
+  const unprotectedRangesBySheetId = (options && options.unprotectedRangesBySheetId) || {};
+  const editorsToKeep        = (options && options.editorsToKeep) || [];
+  const descriptionPrefix    = (options && options.descriptionPrefix) || 'PROTECTED';
+  const preserveExistingEditors = !!(options && options.preserveExistingEditors);
+
+  for (let i = 0; i < sheets.length; i++) {
+    const sh         = sheets[i];
+    const protection = sh.protect();
+    protection.setDescription(`${descriptionPrefix}__${sh.getName()}`);
+    protection.setWarningOnly(false);
+
+    const sid         = String(sh.getSheetId());
+    const unprotected = unprotectedRangesBySheetId[sid] || [];
+    if (unprotected.length) {
+      protection.setUnprotectedRanges(unprotected);
+    }
+
+    if (!preserveExistingEditors) {
+      try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+      if (editorsToKeep.length) {
+        try { protection.addEditors(editorsToKeep); } catch (_) {}
+      }
+    } else if (editorsToKeep.length) {
+      try { protection.addEditors(editorsToKeep); } catch (_) {}
+    }
+
+    try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+  }
+}
+
+function glpProtectWorkingsFileExceptReleaseAndBankMarkDownColumns_(
+  ss,
+  payrollSh,
+  releaseConfirmationCol1,
+  bankTransferMarkDownCol1,
+  monthLabel
+) {
+  const sheets         = ss.getSheets();
+  const payrollSheetId = String(payrollSh.getSheetId());
+
+  for (let i = 0; i < sheets.length; i++) {
+    const sh         = sheets[i];
+    const protection = sh.protect();
+    protection.setDescription(`PAYROLL_WORKINGS_LOCK_${monthLabel}__${sh.getName()}`);
+    protection.setWarningOnly(false);
+
+    if (String(sh.getSheetId()) === payrollSheetId) {
+      const maxRows        = Math.max(sh.getMaxRows(), sh.getLastRow(), 2);
+      const releaseRange   = sh.getRange(2, releaseConfirmationCol1, maxRows - 1, 1);
+      const bankMarkDownRange = sh.getRange(2, bankTransferMarkDownCol1, maxRows - 1, 1);
+      protection.setUnprotectedRanges([releaseRange, bankMarkDownRange]);
+    }
+
+    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+  }
+}
+
+/* =========================================================
+   SMALL HELPERS
+   — UNCHANGED —
+========================================================= */
+
+function glpBuildSpreadsheetUrl_(fileId) {
+  return fileId ? `https://docs.google.com/spreadsheets/d/${fileId}/edit` : '';
+}
+
+function glpRequireHeaderIndex_(headerIndexMap, headerName, tabName) {
+  const k = norm_(headerName);
+  if (!headerIndexMap.has(k)) {
+    throw new Error(`Header "${headerName}" not found in ${tabName}.`);
+  }
+  return headerIndexMap.get(k);
+}

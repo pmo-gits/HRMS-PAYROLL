@@ -1,0 +1,1353 @@
+/*******************************************************
+ * GENERATE PAYSLIPS (v10)
+ *
+ * Runs in the Locked Payroll spreadsheet, after "Generate Bank
+ * Transfer File". Copies PSG.TEMPLATE_FILE_ID (Employees,
+ * Employees_Hindi tabs — each with one formatted sample block,
+ * logo + signature as images) into a monthly Payslip file, then
+ * clones + fills one block per eligible employee.
+ *
+ * Routing: WORKER -> Employees (NON-MIGRANT) or Employees_Hindi
+ * (MIGRANT), via Employee Master. STAFF is handled entirely by a
+ * separate function in this same file — see "STAFF PDF GENERATION"
+ * section below.
+ *
+ * Eligible = PAY_ROLL "Bank Transfer Mark Down" has a real
+ * timestamp (not blank/SKIPPED). Append-only per month via hidden
+ * _GENERATED_LOG — re-runs only add new employees.
+ *
+ * Access: pmo@ runs directly, hrassist@ via Web App, others blocked.
+ *
+ * SETUP: set PSG.TEMPLATE_FILE_ID. Add menu item to the Locked
+ * Payroll file's onOpen — see NOTE at the very end of this file.
+ * The doPost action branch for 'generateStaffPayslipPdfs' is added
+ * in PAYROLL_GEN_6, same place/pattern as the existing
+ * 'generatePayslips' branch — kept consistent with how every other
+ * action is already registered there.
+ *
+ * v4 CHANGES:
+ * - Employees_Hindi now shares Employees' landscape writer/config
+ *   (template layouts are now identical) — WORKER_LEGACY and its
+ *   writer are gone.
+ * - Staff block was 56 rows (32 content + 24 "***" filler rows
+ *   baked into the template) so each employee prints on one page.
+ * - PDF export removed entirely (function, config, and doPost
+ *   branch in PAYROLL_GEN_6 all deleted).
+ *
+ * v5 CHANGES:
+ * - Template migrated to A5 landscape, 1 employee per page, 100%
+ *   scale (was A4: Employees/Employees_Hindi landscape 2-per-page,
+ *   Staffs portrait 1-per-page). Page fit is now handled entirely
+ *   by column widths / row heights / font sizes baked into the
+ *   template.
+ * - Staffs: the 24 "***" filler rows are gone (no longer needed to
+ *   hold a full A4 portrait page). Block is genuinely 32 rows now.
+ *   PSG.STAFF.BLOCK_ROWS / STRIDE updated 56 -> 32 to match.
+ *
+ * v6 CHANGES:
+ * - Total Deductions (I20 on Employees/Employees_Hindi, I19 on
+ *   Staffs) is now SUMMED from the 8 deduction values already
+ *   printed on the payslip — same pattern already used for Actual
+ *   Total Earnings — instead of being pulled from PAY_ROLL's own
+ *   "Total Deductions" column.
+ *
+ * v7 CHANGES:
+ * - Employees / Employees_Hindi: plain blank rows at the end of the
+ *   block didn't reliably hold the A5 page break (same issue Staffs
+ *   had before its "***" filler rows were added). PMO added two
+ *   baked-in "***" filler rows at rows 24-25 in the template, so
+ *   each Worker block is now rows 1-25 (was 1-22 + 1 blank spacer
+ *   at row 23). PSG.WORKER_LANDSCAPE.BLOCK_ROWS / STRIDE updated
+ *   22/23 -> 25/25 — BLOCK_ROWS now equals STRIDE, same pattern as
+ *   Staffs (the filler rows ARE the gap, no separate padding
+ *   needed). The writer's old "push one extra blank spacer row per
+ *   employee" step is removed accordingly.
+ *
+ * v8 CHANGES:
+ * - Staff are no longer processed by generatePayslipsServer_ at
+ *   all. Category = STAFF employees are skipped in that function —
+ *   not written to any tab, not added to _GENERATED_LOG.
+ *
+ * v9 CHANGES:
+ * - Monthly subfolder: MONTHLY PAYSLIPS/<MonthLabel>/ is now
+ *   created (or reused) via a new META_DATA key PAYSLIP_FOLDER_ID.
+ *   generatePayslipsServer_ now creates the Payslip_<Month> file
+ *   inside that subfolder instead of the MONTHLY PAYSLIPS root, and
+ *   self-heals (moves the file in) if it already existed outside
+ *   the subfolder from a run before this change.
+ * - NEW: Staff PDF generation. A brand-new function,
+ *   generateStaffPayslipPdfsServer_, produces ONE individual A4
+ *   portrait PDF per eligible Staff member (100% scale, 0.25"
+ *   margins all sides), saved into the same monthly subfolder.
+ *   - Tracking is self-contained: a "Staff Email Master" tab
+ *     (Employee Code / Name / Email / PDF File ID), seeded in
+ *     the Template file so it copies into every monthly file
+ *     automatically. The "PDF File ID" column (a HYPERLINK to the
+ *     generated PDF) is the ONLY completion marker for Staff — no
+ *     entry is made in _GENERATED_LOG for Staff, to avoid two
+ *     tracking mechanisms for the same fact.
+ *   - If a payroll-eligible Staff member has no row yet in Staff
+ *     Email Master, one is auto-added (Employee Code + Name, Email
+ *     left blank) so their PDF still generates on schedule; the
+ *     blank Email is simply skipped later by the (separate,
+ *     not-yet-built) email-sending step.
+ *   - Processes ONE employee at a time: write block -> flush ->
+ *     export that block's exact row range to PDF -> save to Drive
+ *     -> mark that one row's "PDF File ID" -> next employee.
+ *     A mid-run failure only leaves the unmarked ones pending for
+ *     the next run — nothing to reconcile.
+ *   - Reuses the EXISTING psgWriteStaffTab_ / psgBuildStaffBulkBlock_
+ *     / psgBuildStaffHIColumn_ / psgReadLeaveBalances_ untouched,
+ *     just called with a single-item array per iteration instead of
+ *     a full batch. The Staffs tab keeps growing within the month
+ *     exactly as it did in v7 (still stacked blocks) — it's scratch
+ *     space only now, never itself the deliverable.
+ * - No changes to Employees / Employees_Hindi routing, writers,
+ *   row/column offsets, filler rows, or Total Deductions logic.
+ *
+ * v10 CHANGES (THIS REVISION):
+ * - Speed only, no behavior change: psgLoadStaffEmailMaster_ now
+ *   also returns nextRow (= lastRow + 1) and lastCol computed once,
+ *   up front. psgAppendStaffEmailRow_ uses those in-memory values
+ *   instead of calling sh.getLastRow() / sh.getLastColumn() again
+ *   for every newly auto-added Staff employee inside the per-
+ *   employee loop, and increments cols.nextRow locally after each
+ *   append. Removes 2 Sheets API round-trips per new employee (e.g.
+ *   ~80 fewer calls for a 40-new-employee month). Nothing else in
+ *   this file changes.
+ *******************************************************/
+
+const PSG_WEBAPP_URL     = 'https://script.google.com/macros/s/AKfycbyhAADy_VUoTuWt8QlLGR5B6I5ckJf67FM456CRxHspRmhluFEZikksIXGRB3pkECK5/exec';
+const PSG_OWNER_EMAIL    = 'pmo@butlerleather.com';
+const PSG_ALLOWED_EMAIL  = 'hrassist@butlerleather.com';
+
+const PSG = Object.freeze({
+  TEMPLATE_FILE_ID: '1IrcvPh6zASMqxOrBjAZkt_E5lQt_Slj8Lhvpkx9qyOQ', // Template Payslip file
+
+  FOLDER_ID: '1x2SxEqGO1NFNypcOnC6Rr2VlVz8BSe2S', // MONTHLY PAYSLIP folder (parent of per-month subfolders)
+
+  FILE_PREFIX: 'Payslip',
+
+  TABS: Object.freeze({
+    EMPLOYEES: 'Employees',
+    EMPLOYEES_HINDI: 'Employees_Hindi',
+    STAFFS: 'Staffs',
+    LOG: '_GENERATED_LOG',
+  }),
+
+  CATEGORY: Object.freeze({
+    WORKER: 'WORKER',
+    STAFF: 'STAFF',
+  }),
+
+  MIGRANT: Object.freeze({
+    MIGRANT: 'MIGRANT',
+    NON_MIGRANT: 'NON-MIGRANT',
+  }),
+
+  ACCESS: Object.freeze({
+    EDITORS: Object.freeze(['hrassist@butlerleather.com']),
+    VIEWERS: Object.freeze(['nazneen@butlerleather.com']),
+  }),
+
+  META_KEYS: Object.freeze({
+    PAYSLIP_FILE_ID: 'PAYSLIP_FILE_ID',
+    PAYSLIP_LAST_RUN: 'PAYSLIP_LAST_RUN',
+    PAYSLIP_FOLDER_ID: 'PAYSLIP_FOLDER_ID', // NEW (v9) — the per-month subfolder
+  }),
+
+  // ===== WORKER — LANDSCAPE layout =====
+  WORKER_LANDSCAPE: Object.freeze({
+    BLOCK_ROWS: 25,
+    STRIDE: 25,
+    BULK_COLS: [1, 12],
+    IMG_COLS: [13, 14],
+    PERBLOCK_COLS: [13, 14],
+    PERBLOCK_ROWS: [6, 17],
+  }),
+
+  // ===== STAFF (Staffs) block layout =====
+  // Now used ONLY as scratch space by generateStaffPayslipPdfsServer_
+  // (v9) — each employee's block is written here, exported to its
+  // own PDF, and the tab keeps stacking blocks within the month
+  // exactly like before. No longer part of generatePayslipsServer_.
+  STAFF: Object.freeze({
+    BLOCK_ROWS: 32,
+    STRIDE: 32,
+    BULK_COLS: [1, 7],
+    IMG_COLS: [8, 9],
+    PERBLOCK_COLS: [8, 9],
+    PERBLOCK_ROWS: [6, 27],
+  }),
+
+  // ===== STAFF PDF / Staff Email Master (NEW, v9) =====
+  STAFF_PDF: Object.freeze({
+    TAB_NAME: 'Staff Email Master', // must match the tab name exactly as created in the Template file
+    HEADERS: Object.freeze({
+      EMP_CODE: 'Employee Code',
+      NAME: 'Name',
+      EMAIL: 'Email',
+      PDF_FILE_ID: 'PDF File ID',
+    }),
+    PDF: Object.freeze({
+      PAPER_SIZE: 7,        // 7 = A4
+      PORTRAIT: true,
+      SCALE_MODE: 1,        // 1 = Normal / 100%
+      MARGIN_INCHES: 0.25,  // top/bottom/left/right, confirmed uniform
+    }),
+  }),
+});
+
+/* =========================================================
+   ENTRY POINT — EMPLOYEES / EMPLOYEES_HINDI
+========================================================= */
+
+function generatePayslips() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    if (currentUser === PSG_OWNER_EMAIL.toLowerCase()) {
+      const result = generatePayslipsServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      ui.alert('Generate Payslips', result.message || 'No response received.', ui.ButtonSet.OK);
+      return;
+    }
+
+    if (currentUser === PSG_ALLOWED_EMAIL.toLowerCase()) {
+      if (!PSG_WEBAPP_URL || PSG_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert('Generate Payslips', 'Web App URL is not configured.', ui.ButtonSet.OK);
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(PSG_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'generatePayslips',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      ui.alert('Generate Payslips', result.message || 'No response received from Web App.', ui.ButtonSet.OK);
+      return;
+    }
+
+    ui.alert('Generate Payslips', 'You are not authorized to run this function.', ui.ButtonSet.OK);
+
+  } catch (err) {
+    ui.alert('Generate Payslips', `Error: ${err && err.message ? err.message : err}`, ui.ButtonSet.OK);
+  }
+}
+
+/* =========================================================
+   ENTRY POINT — STAFF PDF GENERATION (NEW, v9)
+========================================================= */
+
+function generateStaffPayslipPdfs() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    if (currentUser === PSG_OWNER_EMAIL.toLowerCase()) {
+      const result = generateStaffPayslipPdfsServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      ui.alert('Generate Staff Payslip PDFs', result.message || 'No response received.', ui.ButtonSet.OK);
+      return;
+    }
+
+    if (currentUser === PSG_ALLOWED_EMAIL.toLowerCase()) {
+      if (!PSG_WEBAPP_URL || PSG_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert('Generate Staff Payslip PDFs', 'Web App URL is not configured.', ui.ButtonSet.OK);
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(PSG_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'generateStaffPayslipPdfs',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      ui.alert('Generate Staff Payslip PDFs', result.message || 'No response received from Web App.', ui.ButtonSet.OK);
+      return;
+    }
+
+    ui.alert('Generate Staff Payslip PDFs', 'You are not authorized to run this function.', ui.ButtonSet.OK);
+
+  } catch (err) {
+    ui.alert('Generate Staff Payslip PDFs', `Error: ${err && err.message ? err.message : err}`, ui.ButtonSet.OK);
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION — EMPLOYEES / EMPLOYEES_HINDI
+   (runs as owner always)
+========================================================= */
+
+function generatePayslipsServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    return { success: false, message: 'Another payslip generation is already running. Please wait and try again.' };
+  }
+
+  let createdNewPayslipFile = false;
+  let anyDataWrittenThisRun = false;
+  let payslipFileForCleanup = null;
+
+  try {
+    if (!PSG.TEMPLATE_FILE_ID || PSG.TEMPLATE_FILE_ID === 'PASTE_TEMPLATE_PAYSLIP_FILE_ID_HERE') {
+      return { success: false, message: 'PSG.TEMPLATE_FILE_ID is not configured. Paste the Template Payslip file ID before running.' };
+    }
+
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+
+    const payrollSh = ss.getSheetByName(CONST.TEMPLATES.PAYROLL_TAB_NAME);
+    if (!payrollSh) throw new Error(`Missing sheet: ${CONST.TEMPLATES.PAYROLL_TAB_NAME}`);
+
+    const metaSh = ss.getSheetByName(CONST.TABS.META_DATA);
+    if (!metaSh) throw new Error(`Missing sheet: ${CONST.TABS.META_DATA}`);
+
+    const lockStatus = String(psgGetMetaValue_(metaSh, 'LOCK_STATUS') || '').trim().toUpperCase();
+    if (lockStatus !== CONST.VALUES.LOCK_STATUS_LOCKED) {
+      return { success: false, message: 'Payroll is not LOCKED. Payslips can only be generated after LOCK_STATUS = LOCKED.' };
+    }
+
+    const monthLabel = String(psgGetMetaValue_(metaSh, 'PAYROLL_MONTH_LABEL') || '').trim();
+    if (!monthLabel) return { success: false, message: 'PAYROLL_MONTH_LABEL is missing in META_DATA.' };
+
+    const lastRow = payrollSh.getLastRow();
+    const lastCol = payrollSh.getLastColumn();
+    if (lastRow < 2 || lastCol < 1) return { success: false, message: 'No payroll data found in PAY_ROLL.' };
+
+    const headers = payrollSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+    const idx = psgBuildHeaderIndex_(headers);
+
+    psgRequireHeader_(idx, 'Employee Code', 'PAY_ROLL');
+    psgRequireHeader_(idx, 'Category', 'PAY_ROLL');
+    psgRequireHeader_(idx, 'Bank Transfer Mark Down', 'PAY_ROLL');
+
+    const data = payrollSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+    const eligible = [];
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const empCode = String(psgGetCell_(row, idx, 'Employee Code') || '').trim();
+      if (!empCode) continue;
+
+      const markDown = String(psgGetCell_(row, idx, 'Bank Transfer Mark Down') || '').trim();
+      if (!psgIsRealTimestamp_(markDown)) continue;
+
+      eligible.push({ row, empCode });
+    }
+
+    if (!eligible.length) {
+      return { success: false, message: 'No eligible employees found (no PAY_ROLL row has a Bank Transfer Mark Down timestamp yet).' };
+    }
+
+    // ---- Get/create this month's subfolder (v9) ----
+    const monthlyFolder = psgGetOrCreateMonthlyFolder_(metaSh, monthLabel);
+
+    let existingFileId = psgExtractSpreadsheetId_(psgGetMetaValue_(metaSh, PSG.META_KEYS.PAYSLIP_FILE_ID));
+    let payslipSs;
+    let payslipFile;
+
+    if (existingFileId) {
+      payslipSs = SpreadsheetApp.openById(existingFileId);
+      payslipFile = DriveApp.getFileById(existingFileId);
+
+      // v9 self-heal: if this file was created before the monthly-subfolder
+      // change (sitting directly in MONTHLY PAYSLIPS), move it in now.
+      psgEnsureFileInFolder_(payslipFile, monthlyFolder);
+    } else {
+      const templateFile = DriveApp.getFileById(PSG.TEMPLATE_FILE_ID);
+      const fileName = `${PSG.FILE_PREFIX}_${monthLabel}`;
+
+      payslipFile = templateFile.makeCopy(fileName, monthlyFolder);
+      payslipSs = SpreadsheetApp.openById(payslipFile.getId());
+
+      existingFileId = payslipFile.getId();
+      createdNewPayslipFile = true;
+      payslipFileForCleanup = payslipFile;
+
+      psgSetMetaHyperlink_(metaSh, PSG.META_KEYS.PAYSLIP_FILE_ID, existingFileId);
+    }
+
+    psgApplyFilePermissions_(payslipFile);
+
+    const empSh = payslipSs.getSheetByName(PSG.TABS.EMPLOYEES);
+    const empHiSh = payslipSs.getSheetByName(PSG.TABS.EMPLOYEES_HINDI);
+    if (!empSh) throw new Error(`Template is missing tab: ${PSG.TABS.EMPLOYEES}`);
+    if (!empHiSh) throw new Error(`Template is missing tab: ${PSG.TABS.EMPLOYEES_HINDI}`);
+    // Staffs tab is intentionally NOT looked up / required here — Staff are
+    // handled entirely by generateStaffPayslipPdfsServer_ (see below).
+
+    const logSh = psgGetOrCreateLogSheet_(payslipSs);
+
+    const processed = psgReadProcessed_(logSh, monthLabel);
+
+    const migrantByCode = psgReadMigrantMap_();
+
+    const newEmployees = [];
+    const newEmployeesHi = [];
+
+    eligible.forEach((item) => {
+      if (processed.has(item.empCode)) return;
+
+      const category = String(psgGetCell_(item.row, idx, 'Category') || '').trim().toUpperCase();
+
+      // STAFF is intentionally skipped here — see generateStaffPayslipPdfsServer_.
+      if (category === PSG.CATEGORY.STAFF) return;
+
+      const migrant = String(migrantByCode.get(item.empCode) || '').trim().toUpperCase();
+      if (migrant === PSG.MIGRANT.MIGRANT) {
+        newEmployeesHi.push(item);
+      } else {
+        newEmployees.push(item);
+      }
+    });
+
+    if (!newEmployees.length && !newEmployeesHi.length) {
+      return { success: true, message: 'No new eligible employees to add — payslips already generated for everyone eligible so far this month.' };
+    }
+
+    if (newEmployees.length) {
+      const already = psgCountForTab_(logSh, monthLabel, PSG.TABS.EMPLOYEES);
+      psgWriteWorkerTab_Landscape_(empSh, newEmployees, idx, monthLabel, already);
+      anyDataWrittenThisRun = true;
+      psgAppendToLog_(logSh, monthLabel, newEmployees.map((x) => x.empCode), PSG.TABS.EMPLOYEES);
+    }
+
+    if (newEmployeesHi.length) {
+      const already = psgCountForTab_(logSh, monthLabel, PSG.TABS.EMPLOYEES_HINDI);
+      psgWriteWorkerTab_Landscape_(empHiSh, newEmployeesHi, idx, monthLabel, already);
+      anyDataWrittenThisRun = true;
+      psgAppendToLog_(logSh, monthLabel, newEmployeesHi.map((x) => x.empCode), PSG.TABS.EMPLOYEES_HINDI);
+    }
+
+    psgSetMetaValue_(metaSh, PSG.META_KEYS.PAYSLIP_LAST_RUN,
+      Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm'));
+
+    const successMsg =
+      `Payslips generated for ${monthLabel}.\n\n` +
+      `New Employees (Tamil): ${newEmployees.length}\n` +
+      `New Employees (Hindi/Migrant): ${newEmployeesHi.length}\n\n` +
+      `File: ${payslipFile.getName()}\n` +
+      `Folder: ${monthlyFolder.getName()}`;
+
+    return { success: true, message: successMsg };
+
+  } catch (err) {
+    if (createdNewPayslipFile && !anyDataWrittenThisRun && payslipFileForCleanup) {
+      try { payslipFileForCleanup.setTrashed(true); } catch (_) {}
+    }
+    return { success: false, message: `Error: ${err && err.message ? err.message : err}` };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION — STAFF PDF GENERATION (NEW, v9)
+   (runs as owner always)
+========================================================= */
+
+function generateStaffPayslipPdfsServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    return { success: false, message: 'Another Staff payslip PDF generation is already running. Please wait and try again.' };
+  }
+
+  try {
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+
+    const payrollSh = ss.getSheetByName(CONST.TEMPLATES.PAYROLL_TAB_NAME);
+    if (!payrollSh) throw new Error(`Missing sheet: ${CONST.TEMPLATES.PAYROLL_TAB_NAME}`);
+
+    const metaSh = ss.getSheetByName(CONST.TABS.META_DATA);
+    if (!metaSh) throw new Error(`Missing sheet: ${CONST.TABS.META_DATA}`);
+
+    const lockStatus = String(psgGetMetaValue_(metaSh, 'LOCK_STATUS') || '').trim().toUpperCase();
+    if (lockStatus !== CONST.VALUES.LOCK_STATUS_LOCKED) {
+      return { success: false, message: 'Payroll is not LOCKED. Staff payslip PDFs can only be generated after LOCK_STATUS = LOCKED.' };
+    }
+
+    const monthLabel = String(psgGetMetaValue_(metaSh, 'PAYROLL_MONTH_LABEL') || '').trim();
+    if (!monthLabel) return { success: false, message: 'PAYROLL_MONTH_LABEL is missing in META_DATA.' };
+
+    const existingFileId = psgExtractSpreadsheetId_(psgGetMetaValue_(metaSh, PSG.META_KEYS.PAYSLIP_FILE_ID));
+    if (!existingFileId) {
+      return { success: false, message: 'No Payslip file found for this month yet. Run "Generate Payslips" first.' };
+    }
+
+    const payslipSs = SpreadsheetApp.openById(existingFileId);
+    const payslipFile = DriveApp.getFileById(existingFileId);
+
+    const monthlyFolder = psgGetOrCreateMonthlyFolder_(metaSh, monthLabel);
+    psgEnsureFileInFolder_(payslipFile, monthlyFolder);
+
+    const staffSh = payslipSs.getSheetByName(PSG.TABS.STAFFS);
+    if (!staffSh) throw new Error(`Payslip file is missing tab: ${PSG.TABS.STAFFS}`);
+
+    const emailSh = payslipSs.getSheetByName(PSG.STAFF_PDF.TAB_NAME);
+    if (!emailSh) throw new Error(`Payslip file is missing tab: ${PSG.STAFF_PDF.TAB_NAME}`);
+
+    const emailData = psgLoadStaffEmailMaster_(emailSh);
+
+    const lastRow = payrollSh.getLastRow();
+    const lastCol = payrollSh.getLastColumn();
+    if (lastRow < 2 || lastCol < 1) return { success: false, message: 'No payroll data found in PAY_ROLL.' };
+
+    const headers = payrollSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+    const idx = psgBuildHeaderIndex_(headers);
+
+    psgRequireHeader_(idx, 'Employee Code', 'PAY_ROLL');
+    psgRequireHeader_(idx, 'Category', 'PAY_ROLL');
+    psgRequireHeader_(idx, 'Bank Transfer Mark Down', 'PAY_ROLL');
+
+    const data = payrollSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+    const eligibleStaff = [];
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const empCode = String(psgGetCell_(row, idx, 'Employee Code') || '').trim();
+      if (!empCode) continue;
+
+      const category = String(psgGetCell_(row, idx, 'Category') || '').trim().toUpperCase();
+      if (category !== PSG.CATEGORY.STAFF) continue;
+
+      const markDown = String(psgGetCell_(row, idx, 'Bank Transfer Mark Down') || '').trim();
+      if (!psgIsRealTimestamp_(markDown)) continue;
+
+      eligibleStaff.push({ row, empCode });
+    }
+
+    if (!eligibleStaff.length) {
+      return { success: false, message: 'No eligible Staff found (no PAY_ROLL row has a Bank Transfer Mark Down timestamp yet).' };
+    }
+
+    // ---- Skip anyone who already has a "PDF File ID" — the ONLY completion marker for Staff ----
+    const pending = eligibleStaff.filter((item) => {
+      const rec = emailData.map.get(item.empCode);
+      return !(rec && rec.fileId);
+    });
+
+    if (!pending.length) {
+      return { success: true, message: 'No new Staff payslip PDFs to generate — everyone eligible already has one this month.' };
+    }
+
+    const leaveByCode = psgReadLeaveBalances_();
+
+    let alreadyGenerated = 0;
+    emailData.map.forEach((rec) => { if (rec.fileId) alreadyGenerated++; });
+
+    let generatedCount = 0;
+
+    for (let i = 0; i < pending.length; i++) {
+      const item = pending[i];
+      const empCode = item.empCode;
+      const name = psgProperCase_(psgGetCell_(item.row, idx, 'Name'));
+
+      let rec = emailData.map.get(empCode);
+      let sheetRow;
+      if (!rec) {
+        sheetRow = psgAppendStaffEmailRow_(emailSh, emailData, empCode, name);
+        rec = { sheetRow, name, email: '', fileId: '' };
+        emailData.map.set(empCode, rec);
+      } else {
+        sheetRow = rec.sheetRow;
+      }
+
+      psgWriteStaffTab_(staffSh, [item], idx, monthLabel, leaveByCode, alreadyGenerated);
+      SpreadsheetApp.flush();
+
+      const L = PSG.STAFF;
+      const blockStart = 1 + alreadyGenerated * L.STRIDE;
+
+      const blob = psgExportStaffBlockToPdf_(existingFileId, staffSh, blockStart, L.BLOCK_ROWS, L.IMG_COLS[1]);
+      const safeNamePart = psgSanitizeFileNamePart_(`${empCode}_${name}`);
+      const pdfName = `${PSG.FILE_PREFIX}_${safeNamePart}_${monthLabel}.pdf`;
+
+      const existingPdf = monthlyFolder.getFilesByName(pdfName);
+      while (existingPdf.hasNext()) { existingPdf.next().setTrashed(true); }
+      const createdPdfFile = monthlyFolder.createFile(blob.setName(pdfName));
+      const pdfFileId = createdPdfFile.getId();
+
+      psgMarkStaffPdfFileId_(emailSh, emailData, sheetRow, pdfFileId);
+
+      alreadyGenerated++;
+      generatedCount++;
+    }
+
+    const successMsg =
+      `Staff payslip PDFs generated for ${monthLabel}.\n\n` +
+      `New PDFs created: ${generatedCount}\n` +
+      `Folder: ${monthlyFolder.getName()}`;
+
+    return { success: true, message: successMsg };
+
+  } catch (err) {
+    return { success: false, message: `Error: ${err && err.message ? err.message : err}` };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/* =========================================================
+   WORKER TAB WRITER — LANDSCAPE — UNCHANGED from v8.
+========================================================= */
+
+function psgWriteWorkerTab_Landscape_(sheet, items, idx, monthLabel, processedSoFar) {
+  const L = PSG.WORKER_LANDSCAPE;
+  const startRow = 1 + processedSoFar * L.STRIDE;
+
+  psgEnsureRowCapacity_(sheet, startRow + items.length * L.STRIDE - 1);
+
+  const templateBlock = sheet.getRange(1, 1, L.BLOCK_ROWS, L.IMG_COLS[1]);
+  const heightRuns = psgReadRowHeightRuns_(sheet, L.STRIDE);
+
+  for (let i = 0; i < items.length; i++) {
+    const blockStart = startRow + i * L.STRIDE;
+    if (blockStart === 1) continue;
+    const destBlock = sheet.getRange(blockStart, 1, L.BLOCK_ROWS, L.IMG_COLS[1]);
+    templateBlock.copyTo(destBlock, SpreadsheetApp.CopyPasteType.PASTE_NORMAL, false);
+    psgApplyRowHeightRuns_(sheet, heightRuns, blockStart);
+  }
+
+  const bannerText = psgBuildMonthBanner_(sheet, monthLabel);
+
+  const labelSnapshot = psgSnapshotBlock_(sheet, L.BLOCK_ROWS, L.BULK_COLS[0], L.BULK_COLS[1]);
+  const wideRowCount = L.PERBLOCK_ROWS[1] - L.PERBLOCK_ROWS[0] + 1;
+  const wideSnapshot = psgSnapshotBlock_(sheet, wideRowCount, L.PERBLOCK_COLS[0], L.PERBLOCK_COLS[1], L.PERBLOCK_ROWS[0]);
+
+  const bulkMatrix = [];
+  const bulkColCount = L.BULK_COLS[1] - L.BULK_COLS[0] + 1;
+  items.forEach((item) => {
+    bulkMatrix.push(...psgBuildWorkerBulkBlock_Landscape_(item.row, idx, bannerText, labelSnapshot));
+  });
+  sheet.getRange(startRow, L.BULK_COLS[0], bulkMatrix.length, bulkColCount).setValues(bulkMatrix);
+
+  items.forEach((item, i) => {
+    const blockStart = startRow + i * L.STRIDE;
+    const wideRowStart = blockStart + (L.PERBLOCK_ROWS[0] - 1);
+    const wideValues = psgBuildWorkerWideBlock_Landscape_(item.row, idx, wideSnapshot);
+    sheet.getRange(wideRowStart, L.PERBLOCK_COLS[0], wideRowCount, 2).setValues(wideValues);
+  });
+}
+
+function psgBuildWorkerBulkBlock_Landscape_(row, idx, bannerText, labelSnapshot) {
+  const g = (h) => psgGetCell_(row, idx, h);
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+
+  const m = labelSnapshot.map((r) => r.slice());
+
+  m[3][0] = bannerText;
+
+  m[5][1] = g('Employee Code');
+  m[5][5] = psgProperCase_(g('Name'));
+  m[5][8] = psgProperCase_(g('Designation'));
+  m[6][1] = g('UAN No');
+  m[6][5] = g('ESI No');
+  m[6][8] = g('Date Of Joining');
+
+  const earnRows = [
+    ['Basic', 'Earned Basic'], ['DA', 'Earned DA'], ['HRA', 'Earned HRA'],
+    ['Conveyance Allowance', 'Earned Conveyance Allowance'],
+    ['Special Allowance', 'Earned Special Allowance'],
+    ['Petrol Conveyance', 'Earned Petrol Conveyance'],
+  ];
+  for (let i = 0; i < 6; i++) {
+    const rr = 9 + i;
+    m[rr][2] = gn(earnRows[i][0]);
+    m[rr][3] = gn(earnRows[i][1]);
+  }
+  m[15][3] = gn('Attendance Bonus');
+  m[16][2] = gn('Increment');
+  m[17][3] = gn('OT Pay');
+  m[18][3] = gn('Carry Forward Pay');
+
+  let actualTotal = 0;
+  for (let i = 0; i < 6; i++) actualTotal += gn(earnRows[i][0]);
+  m[19][2] = actualTotal;
+  m[19][3] = gn('Total Earnings');
+
+  const dedRows = [
+    'Employee PF', 'Employee ESI', 'Advance Deduction', 'LWF',
+    'Professional Tax', 'TDS', 'Late Deduction', 'Other Deductions',
+  ];
+  let totalDeductions = 0;
+  for (let i = 0; i < 8; i++) {
+    const rr = 9 + i;
+    const val = gn(dedRows[i]);
+    m[rr][8] = val;
+    totalDeductions += val;
+  }
+  m[19][8] = totalDeductions;
+
+  m[12][11] = g('Total Working Days');
+  m[14][11] = g('LOP Days');
+  m[16][11] = g('Late Penalty');
+
+  return m;
+}
+
+function psgBuildWorkerWideBlock_Landscape_(row, idx, wideSnapshot) {
+  const g = (h) => psgGetCell_(row, idx, h);
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+
+  const m = wideSnapshot.map((r) => r.slice());
+
+  m[0][0] = psgProperCase_(g('Skill Group'));
+  m[1][0] = g('Bank Account No');
+  m[3][0] = gn('NET');
+  m[5][0] = psgFormatPaidOn_(g('Bank Transfer Mark Down'));
+
+  m[7][1]  = g('Total Present Days');
+  m[9][1]  = g('Layoff Days');
+  m[11][1] = g('OT Hours');
+
+  return m;
+}
+
+/* =========================================================
+   STAFF TAB WRITER (scratch space for PDF export as of v9)
+   UNCHANGED logic — called with single-item arrays now instead
+   of a full batch, from generateStaffPayslipPdfsServer_.
+========================================================= */
+
+function psgWriteStaffTab_(sheet, items, idx, monthLabel, leaveByCode, processedSoFar) {
+  const L = PSG.STAFF;
+  const startRow = 1 + processedSoFar * L.STRIDE;
+
+  psgEnsureRowCapacity_(sheet, startRow + items.length * L.STRIDE - 1);
+
+  const templateBlock = sheet.getRange(1, 1, L.BLOCK_ROWS, L.IMG_COLS[1]);
+  const heightRuns = psgReadRowHeightRuns_(sheet, L.STRIDE);
+
+  for (let i = 0; i < items.length; i++) {
+    const blockStart = startRow + i * L.STRIDE;
+    if (blockStart === 1) continue;
+    const destBlock = sheet.getRange(blockStart, 1, L.BLOCK_ROWS, L.IMG_COLS[1]);
+    templateBlock.copyTo(destBlock, SpreadsheetApp.CopyPasteType.PASTE_NORMAL, false);
+    psgApplyRowHeightRuns_(sheet, heightRuns, blockStart);
+  }
+
+  const bannerText = psgBuildMonthBanner_(sheet, monthLabel);
+  const labelSnapshot = psgSnapshotBlock_(sheet, L.BLOCK_ROWS, L.BULK_COLS[0], L.BULK_COLS[1]);
+
+  const bulkMatrix = [];
+  const bulkColCount = L.BULK_COLS[1] - L.BULK_COLS[0] + 1;
+  items.forEach((item) => {
+    bulkMatrix.push(...psgBuildStaffBulkBlock_(item.row, idx, bannerText, labelSnapshot));
+  });
+  sheet.getRange(startRow, L.BULK_COLS[0], bulkMatrix.length, bulkColCount).setValues(bulkMatrix);
+
+  items.forEach((item, i) => {
+    const blockStart = startRow + i * L.STRIDE;
+    const hiRowStart = blockStart + (L.PERBLOCK_ROWS[0] - 1);
+    const hiRowCount = L.PERBLOCK_ROWS[1] - L.PERBLOCK_ROWS[0] + 1;
+    const hiValues = psgBuildStaffHIColumn_(item.row, idx, leaveByCode, item.empCode);
+    sheet.getRange(hiRowStart, L.PERBLOCK_COLS[0], hiRowCount, 2).setValues(hiValues);
+  });
+}
+
+function psgBuildStaffBulkBlock_(row, idx, bannerText, labelSnapshot) {
+  const g = (h) => psgGetCell_(row, idx, h);
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+
+  const m = labelSnapshot.map((r) => r.slice());
+
+  m[3][0] = bannerText;
+
+  m[5][1] = g('Employee Code');
+  m[6][1] = psgProperCase_(g('Designation'));
+  m[7][1] = g('UAN No');
+  m[8][1] = g('ESI No');
+
+  const basic = gn('Basic');
+  const da = gn('DA');
+  const gross = gn('Gross');
+
+  m[10][2] = basic;
+  m[10][3] = gn('Earned Basic');
+  m[11][2] = da;
+  m[11][3] = gn('Earned DA');
+  m[12][2] = gn('HRA');
+  m[12][3] = gn('Earned HRA');
+  m[13][2] = gn('Conveyance Allowance');
+  m[13][3] = gn('Earned Conveyance Allowance');
+  m[14][2] = gn('Special Allowance');
+  m[14][3] = gn('Earned Special Allowance');
+  m[15][2] = gn('Petrol Conveyance');
+  m[15][3] = gn('Earned Petrol Conveyance');
+  m[16][2] = gn('Increment');
+
+  m[18][2] = gross;
+  m[18][3] = gn('Earned Total');
+
+  const employerPf = gn('Employer PF');
+  const employerEsi = gn('Employer ESI');
+  const elCost = Math.round(((basic + da) / 26) * 100) / 100;
+  const costToCompany = Math.round((gross + employerPf + employerEsi + elCost) * 100) / 100;
+
+  m[21][2] = employerPf;
+  m[22][2] = employerEsi;
+  m[23][2] = elCost;
+  m[24][2] = costToCompany;
+
+  m[26][6] = gn('NET');
+
+  m[30][0] = g('Total Working Days');
+  m[30][1] = g('Total Present Days');
+  m[30][2] = g('LOP Days');
+  m[30][3] = g('Layoff Days');
+  m[30][5] = g('Late Penalty');
+
+  return m;
+}
+
+function psgBuildStaffHIColumn_(row, idx, leaveByCode, empCode) {
+  const g = (h) => psgGetCell_(row, idx, h);
+  const gn = (h) => psgToNumber_(psgGetCell_(row, idx, h));
+  const leave = leaveByCode.get(empCode) || { el: '', cl: '', sl: '' };
+
+  const out = [];
+  for (let i = 0; i < 22; i++) out.push(['', '']);
+
+  const employeePf = gn('Employee PF');
+  const employeeEsi = gn('Employee ESI');
+  const tds = gn('TDS');
+  const professionalTax = gn('Professional Tax');
+  const lwf = gn('LWF');
+  const advanceDeduction = gn('Advance Deduction');
+  const lateDeduction = gn('Late Deduction');
+  const otherDeductions = gn('Other Deductions');
+
+  const totalDeductions = employeePf + employeeEsi + tds + professionalTax
+    + lwf + advanceDeduction + lateDeduction + otherDeductions;
+
+  out[0]  = [psgProperCase_(g('Name')), ''];
+  out[1]  = [g('Date Of Joining'), ''];
+  out[2]  = [g('Bank Account No'), ''];
+  out[3]  = [psgFormatPaidOn_(g('Bank Transfer Mark Down')), ''];
+  out[5]  = ['', employeePf];
+  out[6]  = ['', employeeEsi];
+  out[7]  = ['', tds];
+  out[8]  = ['', professionalTax];
+  out[9]  = ['', lwf];
+  out[10] = ['', advanceDeduction];
+  out[11] = ['', lateDeduction];
+  out[12] = ['', otherDeductions];
+  out[13] = ['', totalDeductions];
+  out[15] = ['Approved', 'Balance'];
+  out[16] = [g('Approved EL Days'), leave.el];
+  out[17] = [g('Approved CL Days'), leave.cl];
+  out[18] = [g('Approved SL Days'), leave.sl];
+
+  return out;
+}
+
+/* =========================================================
+   STAFF PDF EXPORT (NEW, v9)
+========================================================= */
+
+function psgExportStaffBlockToPdf_(spreadsheetId, sheet, rowStart, rowCount, colCount) {
+  const gid = sheet.getSheetId();
+  const rowEnd = rowStart + rowCount - 1;
+  const P = PSG.STAFF_PDF.PDF;
+
+  const url =
+    `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export` +
+    `?format=pdf` +
+    `&gid=${gid}` +
+    `&size=${P.PAPER_SIZE}` +
+    `&portrait=${P.PORTRAIT}` +
+    `&scale=${P.SCALE_MODE}` +
+    `&top_margin=${P.MARGIN_INCHES}` +
+    `&bottom_margin=${P.MARGIN_INCHES}` +
+    `&left_margin=${P.MARGIN_INCHES}` +
+    `&right_margin=${P.MARGIN_INCHES}` +
+    `&gridlines=false` +
+    `&printtitle=false` +
+    `&sheetnames=false` +
+    `&pagenum=false` +
+    `&horizontal_alignment=CENTER` +
+    `&vertical_alignment=TOP` +
+    `&r1=${rowStart - 1}&c1=0&r2=${rowEnd}&c2=${colCount}`;
+
+  const response = UrlFetchApp.fetch(url, {
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true,
+  });
+
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`PDF export failed for rows ${rowStart}-${rowEnd} (HTTP ${response.getResponseCode()}).`);
+  }
+
+  return response.getBlob();
+}
+
+/* =========================================================
+   STAFF EMAIL MASTER
+   v10: psgLoadStaffEmailMaster_ now also returns nextRow / lastCol
+   computed once up front, so psgAppendStaffEmailRow_ no longer
+   re-queries the sheet for these on every newly auto-added Staff
+   employee inside the per-employee loop. Everything else here is
+   unchanged from v9.
+========================================================= */
+
+function psgLoadStaffEmailMaster_(sh) {
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = psgBuildHeaderIndex_(headers);
+
+  const H = PSG.STAFF_PDF.HEADERS;
+  const cCode = psgRequireHeader_(idx, H.EMP_CODE, PSG.STAFF_PDF.TAB_NAME);
+  const cName = psgRequireHeader_(idx, H.NAME, PSG.STAFF_PDF.TAB_NAME);
+  const cEmail = psgRequireHeader_(idx, H.EMAIL, PSG.STAFF_PDF.TAB_NAME);
+  const cFileId = psgRequireHeader_(idx, H.PDF_FILE_ID, PSG.STAFF_PDF.TAB_NAME);
+
+  const map = new Map();
+  const lastRow = sh.getLastRow();
+
+  if (lastRow >= 2) {
+    // getDisplayValues() on a HYPERLINK formula cell returns the rendered
+    // link text (the file ID itself, per psgMarkStaffPdfFileId_ below) —
+    // same convention already used for PAYSLIP_FILE_ID / PAYSLIP_FOLDER_ID
+    // in META_DATA.
+    const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+    data.forEach((r, i) => {
+      const code = String(r[cCode] || '').trim();
+      if (!code) return;
+      map.set(code, {
+        sheetRow: i + 2,
+        name: r[cName] || '',
+        email: r[cEmail] || '',
+        fileId: String(r[cFileId] || '').trim(),
+      });
+    });
+  }
+
+  // NEW (v10) — computed once here, kept in memory for the rest of the
+  // run instead of re-querying sh.getLastRow() / sh.getLastColumn() on
+  // every new Staff employee appended during the loop.
+  return {
+    cCode, cName, cEmail, cFileId, map,
+    nextRow: lastRow + 1,
+    lastCol: Math.max(lastCol, cCode + 1, cName + 1, cEmail + 1, cFileId + 1),
+  };
+}
+
+function psgAppendStaffEmailRow_(sh, cols, empCode, name) {
+  // v10: uses in-memory cols.nextRow / cols.lastCol (set by
+  // psgLoadStaffEmailMaster_ and incremented here) instead of calling
+  // sh.getLastRow() / sh.getLastColumn() again for every new employee.
+  const newRow = cols.nextRow;
+  const rowValues = new Array(cols.lastCol).fill('');
+  rowValues[cols.cCode] = empCode;
+  rowValues[cols.cName] = name;
+  sh.getRange(newRow, 1, 1, cols.lastCol).setValues([rowValues]);
+  cols.nextRow++;
+  return newRow;
+}
+
+// Writes the generated PDF's Drive file ID into the "PDF File ID" column,
+// as a clickable HYPERLINK (same convention as psgSetMetaHyperlink_ /
+// psgSetMetaFolderHyperlink_) — the cell's presence/absence is the ONLY
+// completion marker for Staff PDF generation (no separate timestamp).
+function psgMarkStaffPdfFileId_(sh, cols, sheetRow, pdfFileId) {
+  const formula = `=HYPERLINK("https://drive.google.com/file/d/${pdfFileId}/view","${pdfFileId}")`;
+  sh.getRange(sheetRow, cols.cFileId + 1).setFormula(formula);
+}
+
+/* =========================================================
+   MONTHLY SUBFOLDER (NEW, v9)
+========================================================= */
+
+function psgGetOrCreateMonthlyFolder_(metaSh, monthLabel) {
+  let folderId = psgExtractSpreadsheetId_(psgGetMetaValue_(metaSh, PSG.META_KEYS.PAYSLIP_FOLDER_ID));
+
+  if (folderId) {
+    try {
+      return DriveApp.getFolderById(folderId);
+    } catch (_) {
+      folderId = '';
+    }
+  }
+
+  const parent = DriveApp.getFolderById(PSG.FOLDER_ID);
+  const existing = parent.getFoldersByName(monthLabel);
+  const folder = existing.hasNext() ? existing.next() : parent.createFolder(monthLabel);
+
+  psgSetMetaFolderHyperlink_(metaSh, PSG.META_KEYS.PAYSLIP_FOLDER_ID, folder.getId());
+
+  return folder;
+}
+
+function psgEnsureFileInFolder_(file, targetFolder) {
+  const targetId = targetFolder.getId();
+  const parents = file.getParents();
+  while (parents.hasNext()) {
+    if (parents.next().getId() === targetId) return;
+  }
+  file.moveTo(targetFolder);
+}
+
+/* =========================================================
+   MIGRANT LOOKUP (Employee Master) — UNCHANGED from v8.
+========================================================= */
+
+function psgReadMigrantMap_() {
+  const ss = SpreadsheetApp.openById(CONST.SOURCES.EMPLOYEE_MASTER_SS_ID);
+  const sh = ss.getSheetByName(CONST.TABS.EMPLOYEE_MASTER);
+  if (!sh) throw new Error(`Employee Master tab not found: ${CONST.TABS.EMPLOYEE_MASTER}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  const map = new Map();
+  if (lastRow < 2) return map;
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = psgBuildHeaderIndex_(headers);
+
+  const cId = idx[psgNorm_('ID.NO')];
+  const cMigrant = idx[psgNorm_('MIGRANT')];
+  if (cId === undefined) throw new Error('Employee Master missing header: ID.NO');
+  if (cMigrant === undefined) throw new Error('Employee Master missing header: MIGRANT');
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+  data.forEach((r) => {
+    const id = String(r[cId] || '').trim();
+    if (!id) return;
+    map.set(id, r[cMigrant]);
+  });
+
+  return map;
+}
+
+/* =========================================================
+   LEAVE MASTER LOOKUP — UNCHANGED from v8.
+========================================================= */
+
+function psgReadLeaveBalances_() {
+  const ss = SpreadsheetApp.openById(CONST.SOURCES.LEAVE_MASTER_SS_ID);
+  const sh = ss.getSheetByName(CONST.TABS.LEAVE_MASTER);
+  if (!sh) throw new Error(`Leave Master tab not found: ${CONST.TABS.LEAVE_MASTER}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  const map = new Map();
+  if (lastRow < 2) return map;
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = psgBuildHeaderIndex_(headers);
+
+  const cId = idx[psgNorm_('ID.NO')];
+  if (cId === undefined) throw new Error('LEAVE_MASTER missing header: ID.NO');
+
+  const cEl = idx[psgNorm_('EL BALANCE')];
+  const cCl = idx[psgNorm_('CL BALANCE')];
+  const cSl = idx[psgNorm_('SL BALANCE')];
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+  data.forEach((r) => {
+    const id = String(r[cId] || '').trim();
+    if (!id) return;
+    map.set(id, {
+      el: cEl !== undefined ? r[cEl] : '',
+      cl: cCl !== undefined ? r[cCl] : '',
+      sl: cSl !== undefined ? r[cSl] : '',
+    });
+  });
+
+  return map;
+}
+
+/* =========================================================
+   FILE / PERMISSIONS — UNCHANGED from v8.
+========================================================= */
+
+function psgGetOrCreateLogSheet_(ss) {
+  let sh = ss.getSheetByName(PSG.TABS.LOG);
+  if (!sh) {
+    sh = ss.insertSheet(PSG.TABS.LOG);
+    sh.getRange(1, 1, 1, 3).setValues([['Payroll Month', 'Employee Code', 'Tab Name']]);
+    try { sh.hideSheet(); } catch (_) {}
+  }
+  return sh;
+}
+
+function psgApplyFilePermissions_(file) {
+  PSG.ACCESS.EDITORS.forEach((email) => { try { file.addEditor(email); } catch (_) {} });
+  PSG.ACCESS.VIEWERS.forEach((email) => { try { file.addViewer(email); } catch (_) {} });
+}
+
+/* =========================================================
+   APPEND-ONLY LOG (Employees/Employees_Hindi ONLY) — UNCHANGED.
+========================================================= */
+
+function psgReadProcessed_(logSh, monthLabel) {
+  const lastRow = logSh.getLastRow();
+  const set = new Set();
+  if (lastRow < 2) return set;
+
+  const data = logSh.getRange(2, 1, lastRow - 1, 3).getDisplayValues();
+  data.forEach((r) => {
+    if (psgNorm_(r[0]) === psgNorm_(monthLabel)) set.add(String(r[1] || '').trim());
+  });
+
+  return set;
+}
+
+function psgCountForTab_(logSh, monthLabel, tabName) {
+  const lastRow = logSh.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const data = logSh.getRange(2, 1, lastRow - 1, 3).getDisplayValues();
+  let count = 0;
+  data.forEach((r) => {
+    if (psgNorm_(r[0]) === psgNorm_(monthLabel) && psgNorm_(r[2]) === psgNorm_(tabName)) count++;
+  });
+
+  return count;
+}
+
+function psgAppendToLog_(logSh, monthLabel, empCodes, tabName) {
+  if (!empCodes.length) return;
+  const startRow = logSh.getLastRow() + 1;
+  const rows = empCodes.map((c) => [monthLabel, c, tabName]);
+  logSh.getRange(startRow, 1, rows.length, 3).setValues(rows);
+}
+
+/* =========================================================
+   META_DATA HELPERS — UNCHANGED from v8, plus one NEW helper
+   (psgSetMetaFolderHyperlink_) for v9.
+========================================================= */
+
+function psgGetMetaValue_(metaSh, key) {
+  const lastRow = metaSh.getLastRow();
+  if (lastRow < 1) return '';
+  const values = metaSh.getRange(1, 1, lastRow, 2).getDisplayValues();
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || '').trim() === String(key).trim()) return values[i][1];
+  }
+  return '';
+}
+
+function psgSetMetaValue_(metaSh, key, value) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(key).trim();
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setValue(value);
+        return;
+      }
+    }
+  }
+  metaSh.appendRow([keyText, value]);
+}
+
+function psgSetMetaHyperlink_(metaSh, key, spreadsheetId) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(key).trim();
+  const formula = `=HYPERLINK("https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit","${spreadsheetId}")`;
+
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setFormula(formula);
+        return;
+      }
+    }
+  }
+  metaSh.appendRow([keyText, '']);
+  metaSh.getRange(metaSh.getLastRow(), 2).setFormula(formula);
+}
+
+// NEW (v9) — same pattern as psgSetMetaHyperlink_ but for a Drive folder.
+function psgSetMetaFolderHyperlink_(metaSh, key, folderId) {
+  const lastRow = metaSh.getLastRow();
+  const keyText = String(key).trim();
+  const formula = `=HYPERLINK("https://drive.google.com/drive/folders/${folderId}","${folderId}")`;
+
+  if (lastRow >= 1) {
+    const keys = metaSh.getRange(1, 1, lastRow, 1).getDisplayValues();
+    for (let i = 0; i < keys.length; i++) {
+      if (String(keys[i][0] || '').trim() === keyText) {
+        metaSh.getRange(i + 1, 2).setFormula(formula);
+        return;
+      }
+    }
+  }
+  metaSh.appendRow([keyText, '']);
+  metaSh.getRange(metaSh.getLastRow(), 2).setFormula(formula);
+}
+
+/* =========================================================
+   SMALL HELPERS — UNCHANGED from v8, plus one NEW helper
+   (psgSanitizeFileNamePart_) for v9.
+========================================================= */
+
+function psgNorm_(v) {
+  return String(v || '').trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
+function psgBuildHeaderIndex_(headers) {
+  const idx = {};
+  headers.forEach((h, i) => {
+    const k = psgNorm_(h);
+    if (k && idx[k] === undefined) idx[k] = i;
+  });
+  return idx;
+}
+
+function psgRequireHeader_(idx, headerName, sheetName) {
+  const k = psgNorm_(headerName);
+  if (idx[k] === undefined) throw new Error(`Missing required header "${headerName}" in sheet "${sheetName}".`);
+  return idx[k];
+}
+
+function psgGetCell_(row, idx, headerName) {
+  const c = idx[psgNorm_(headerName)];
+  return c === undefined ? '' : row[c];
+}
+
+function psgToNumber_(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  const n = Number(String(v).replace(/[,₹% ]/g, '').trim());
+  return isNaN(n) ? 0 : n;
+}
+
+function psgIsRealTimestamp_(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  if (text === 'SKIPPED - NET 0') return false;
+  if (text === 'SKIPPED - NEGATIVE') return false;
+  return true;
+}
+
+function psgFormatPaidOn_(rawMarkDown) {
+  const raw = String(rawMarkDown || '').trim();
+  if (!raw) return '';
+  const d = new Date(raw.replace(' ', 'T'));
+  if (isNaN(d)) return raw;
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'MM/dd/yyyy');
+}
+
+function psgProperCase_(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  return text
+    .toLowerCase()
+    .replace(/([a-z])([a-z]*)/gi, (match, first, rest) => first.toUpperCase() + rest);
+}
+
+function psgEmptyMatrix_(rows, cols) {
+  const m = [];
+  for (let r = 0; r < rows; r++) m.push(new Array(cols).fill(''));
+  return m;
+}
+
+function psgEnsureRowCapacity_(sheet, neededRows) {
+  const currentMax = sheet.getMaxRows();
+  if (currentMax < neededRows) {
+    sheet.insertRowsAfter(currentMax, neededRows - currentMax);
+  }
+}
+
+function psgReadRowHeightRuns_(sheet, blockRows) {
+  const heights = [];
+  for (let r = 1; r <= blockRows; r++) heights.push(sheet.getRowHeight(r));
+
+  const runs = [];
+  let i = 0;
+  while (i < heights.length) {
+    let j = i;
+    while (j + 1 < heights.length && heights[j + 1] === heights[i]) j++;
+    runs.push({ offset: i, count: j - i + 1, height: heights[i] });
+    i = j + 1;
+  }
+  return runs;
+}
+
+function psgApplyRowHeightRuns_(sheet, runs, destBlockStart) {
+  runs.forEach((run) => {
+    sheet.setRowHeights(destBlockStart + run.offset, run.count, run.height);
+  });
+}
+
+function psgExtractSpreadsheetId_(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const match = text.match(/[-\w]{25,}/);
+  return match ? match[0] : '';
+}
+
+function psgSnapshotBlock_(sheet, numRows, colStart, colEnd, rowStart) {
+  const startRow = rowStart || 1;
+  const colCount = colEnd - colStart + 1;
+  const values = sheet.getRange(startRow, colStart, numRows, colCount).getValues();
+  return values.map((r) => r.slice());
+}
+
+function psgBuildMonthBanner_(sheet, monthLabel) {
+  const existing = String(sheet.getRange(4, 1).getValue() || '');
+  const dashIdx = existing.indexOf('—');
+  const prefix = dashIdx > -1 ? existing.substring(0, dashIdx).trim() : existing.trim();
+  return `${prefix}  —  ${monthLabel.toUpperCase()}`;
+}
+
+// NEW (v9) — strips characters unsafe for Drive filenames.
+function psgSanitizeFileNamePart_(text) {
+  return String(text || '')
+    .replace(/[\\\/:*?"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/* =========================================================
+   NOTE — CHANGES NEEDED IN OTHER FILES (NOT included here,
+   since they live elsewhere and I don't have those exact
+   current file contents to safely edit in place):
+
+   1) TEMPLATE FILE: "Staff Email Master" tab headers are now
+      exactly: Employee Code | Name | Email | PDF File ID
+      (already updated per PMO's latest instruction — no change
+      needed if you've already renamed the 4th header.)
+
+   2) The Locked Payroll spreadsheet's own onOpen() menu — add a
+      menu item alongside the existing "Generate Payslips" item:
+
+        .addItem('Generate Staff Payslip PDFs', 'generateStaffPayslipPdfs')
+========================================================= */

@@ -1,0 +1,973 @@
+/*******************************************************
+ * GET PAYROLL DATA — PAY_ROLL (Script-filled columns only)
+ *
+ * Updated to use VALIDATE ATTENDANCE gate:
+ * ✅ Reads attendance link/id from META_DATA (no folder search)
+ * ✅ Pre-checks (hard stop):
+ *    1) ATTENDANCE_VALIDATION contains "VALIDATED"
+ *    2) ATTENDANCE_FILE_ID exists
+ *    3) PAYROLL_MONTH_LABEL matches current file month label
+ *    4) Attendance file lastUpdated matches ATTENDANCE_LAST_UPDATED (stale -> force re-validate)
+ * ✅ ADDITIONAL REQUIRED PRECHECKS (as requested):
+ *    5) Attendance -> Salary Advance deductions -> Payroll Status must NOT be "LOCKED"
+ *    6) Attendance -> Attendance entry -> LOCKED STATUS must contain "LOCKED"
+ * ✅ LOCK discipline: if LOCK_STATUS=LOCKED → stop
+ * ✅ Header-based mapping only
+ * ✅ Idempotent writes, no formula overwrite
+ * ✅ User gate: pmo = direct, hrassist = Web App, others = blocked (alert)
+ * ✅ PAY_ROLL tab protected after data write
+ *    (Payroll Release Confirmation & Bank Transfer Mark Down remain editable)
+ * ✅ doPost removed — routed via Script 2's doPost
+ *******************************************************/
+
+const GPD_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbyhAADy_VUoTuWt8QlLGR5B6I5ckJf67FM456CRxHspRmhluFEZikksIXGRB3pkECK5/exec'; // reuse same Web App URL as Script 2
+const GPD_OWNER_EMAIL = 'pmo@butlerleather.com';
+const GPD_ALLOWED_EMAIL = 'hrassist@butlerleather.com';
+
+/* =========================================================
+   ENTRY POINT
+========================================================= */
+
+function getPayrollData() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    // ── Owner: run directly ──
+    if (currentUser === GPD_OWNER_EMAIL.toLowerCase()) {
+      getPayrollDataServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      return;
+    }
+
+    // ── Allowed user: call Web App (runs as owner) ──
+    if (currentUser === GPD_ALLOWED_EMAIL.toLowerCase()) {
+      if (!GPD_WEBAPP_URL || GPD_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert(
+          'Get Payroll Data',
+          'Web App URL is not configured. Please deploy the Web App and paste the URL in GLP_WEBAPP_URL.',
+          ui.ButtonSet.OK
+        );
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(GPD_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'getPayrollData',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      if (result.message) {
+        ui.alert('Get Payroll Data', result.message, ui.ButtonSet.OK);
+      }
+      return;
+    }
+
+    // ── Anyone else: blocked ──
+    ui.alert(
+      'Get Payroll Data',
+      'You are not authorized to run this function.',
+      ui.ButtonSet.OK
+    );
+
+  } catch (err) {
+    ui.alert(
+      'Get Payroll Data',
+      `Error: ${err && err.message ? err.message : err}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function getPayrollDataServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  const runMode = String(payload.runMode || 'webapp').trim();
+
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+
+  let ui = null;
+  if (runMode === 'direct') {
+    try { ui = SpreadsheetApp.getUi(); } catch (_) { ui = null; }
+  }
+
+  const alert_ = (title, msg) => {
+    if (ui) ui.alert(title, msg, ui.ButtonSet.OK);
+    return { success: false, message: msg };
+  };
+
+  // ---- 0) Lock check (META_DATA) ----
+  const meta = ss.getSheetByName('META_DATA');
+  if (!meta) throw new Error('Missing required tab: META_DATA');
+
+  const lockStatus = (getMetaValue_(meta, 'LOCK_STATUS') || '').toString().trim().toUpperCase();
+  if (lockStatus === 'LOCKED') {
+    return alert_('Get Payroll Data', 'Skipped: Payroll is LOCKED.');
+  }
+
+  // ---- 1) Resolve payroll month from THIS file name ----
+  const fileName = ss.getName();
+  const monthInfo = parsePayrollMonthFromName_(fileName);
+  if (!monthInfo) {
+    throw new Error(
+      `Cannot parse payroll month from file name: "${fileName}". ` +
+      `Expected like "Payroll-Workings_January_2026".`
+    );
+  }
+  const { monthLabel, monthStart } = monthInfo;
+
+  // ---- 2) META gating: must be validated and consistent ----
+  const validation = String(getMetaValue_(meta, 'ATTENDANCE_VALIDATION') || '').trim().toUpperCase();
+  if (!validation.includes('VALIDATED')) {
+    return alert_('Get Payroll Data', 'Run "Validate Attendance" first.');
+  }
+
+  const storedMonth = String(getMetaValue_(meta, 'PAYROLL_MONTH_LABEL') || '').trim();
+  if (!storedMonth || norm_(storedMonth) !== norm_(monthLabel)) {
+    return alert_('Get Payroll Data', `Month mismatch. Re-run "Validate Attendance". (Expected ${monthLabel})`);
+  }
+
+  const attendanceLinkOrId = String(getMetaValue_(meta, 'ATTENDANCE_FILE_ID') || '').trim();
+  if (!attendanceLinkOrId) {
+    return alert_('Get Payroll Data', 'Missing ATTENDANCE_FILE_ID in META_DATA. Re-run "Validate Attendance".');
+  }
+
+  const attendanceFileId = extractSpreadsheetId_(attendanceLinkOrId);
+  if (!attendanceFileId) {
+    return alert_('Get Payroll Data', 'ATTENDANCE_FILE_ID in META_DATA is not a valid file link/ID. Re-run "Validate Attendance".');
+  }
+
+  // ---- 3) Stale-validation protection: compare Drive lastUpdated ----
+  const storedUpdatedStr = String(getMetaValue_(meta, 'ATTENDANCE_LAST_UPDATED') || '').trim();
+  if (!storedUpdatedStr) {
+    return alert_('Get Payroll Data', 'Missing ATTENDANCE_LAST_UPDATED. Re-run "Validate Attendance".');
+  }
+
+  const attendanceFile = DriveApp.getFileById(attendanceFileId);
+  const currentUpdated = attendanceFile.getLastUpdated();
+  const currentUpdatedStr = Utilities.formatDate(currentUpdated, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+
+  if (storedUpdatedStr !== currentUpdatedStr) {
+    return alert_('Get Payroll Data', 'Attendance file changed after validation. Please re-run "Validate Attendance".');
+  }
+
+  // (Traceability: keep month label in META)
+  setMetaValue_(meta, 'PAYROLL_MONTH_LABEL', monthLabel);
+
+  // ---- 4) Open PAY_ROLL and read headers ----
+  const payroll = ss.getSheetByName(CONST.TEMPLATES.PAYROLL_TAB_NAME);
+  if (!payroll) throw new Error(`Missing required tab: ${CONST.TEMPLATES.PAYROLL_TAB_NAME}`);
+
+  const payrollLastCol = payroll.getLastColumn();
+  if (payrollLastCol < 1) throw new Error('PAY_ROLL has no headers.');
+
+  const payrollHeaders = payroll.getRange(1, 1, 1, payrollLastCol).getDisplayValues()[0];
+  const payIdx = buildHeaderIndex_(payrollHeaders);
+
+  const keyPayroll = CONST.KEYS.PAYROLL;
+  if (!payIdx.has(norm_(keyPayroll))) throw new Error(`PAY_ROLL missing key column: ${keyPayroll}`);
+
+  const nonScript = new Set((CONST.NON_SCRIPT_COLUMNS || []).map(norm_));
+
+  // ---- 5) Open Attendance using stored file ID ----
+  const attSS = SpreadsheetApp.openById(attendanceFileId);
+
+  // ---- 5A) REQUIRED PRECHECK: Salary Advance deductions -> Payroll Status must NOT be LOCKED ----
+  {
+    const saSh = attSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+    if (!saSh) throw new Error(`Attendance tab not found: ${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS}`);
+
+    const saLastRow = saSh.getLastRow();
+    const saLastCol = saSh.getLastColumn();
+    if (saLastRow >= 2 && saLastCol >= 1) {
+      const saHeaders = saSh.getRange(1, 1, 1, saLastCol).getDisplayValues()[0];
+      const saIdx = buildHeaderIndex_(saHeaders);
+
+      const kPS = norm_('Payroll Status');
+      if (!saIdx.has(kPS)) throw new Error(`Tab "${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS}" missing header: Payroll Status`);
+
+      const psCol = saIdx.get(kPS) + 1;
+      const psVals = saSh.getRange(2, psCol, saLastRow - 1, 1).getDisplayValues();
+
+      for (const r of psVals) {
+        const v = String(r[0] || '').trim().toUpperCase();
+        if (v === 'LOCKED') {
+          return alert_('Get Payroll Data', 'Payroll already locked.');
+        }
+      }
+    }
+  }
+
+  // ---- 5B) REQUIRED PRECHECK: Attendance entry -> LOCKED STATUS must contain LOCKED ----
+  {
+    const entrySh = attSS.getSheetByName(CONST.TABS.ATTENDANCE_ENTRY);
+    if (!entrySh) throw new Error(`Attendance tab not found: ${CONST.TABS.ATTENDANCE_ENTRY}`);
+
+    const eLastRow = entrySh.getLastRow();
+    const eLastCol = entrySh.getLastColumn();
+    if (eLastRow < 2 || eLastCol < 1) {
+      return alert_('Get Payroll Data', 'Attendance entry is empty. Lock the attendance then run the payroll.');
+    }
+
+    const eHeaders = entrySh.getRange(1, 1, 1, eLastCol).getDisplayValues()[0];
+    const eIdx = buildHeaderIndex_(eHeaders);
+
+    const kLocked = norm_('LOCKED STATUS');
+    if (!eIdx.has(kLocked)) throw new Error(`Tab "${CONST.TABS.ATTENDANCE_ENTRY}" missing header: LOCKED STATUS`);
+
+    const lockedCol = eIdx.get(kLocked) + 1;
+    const lockedVals = entrySh.getRange(2, lockedCol, eLastRow - 1, 1).getDisplayValues();
+
+    const anyLocked = lockedVals.some((r) => String(r[0] || '').toUpperCase().includes('LOCKED'));
+    if (!anyLocked) {
+      return alert_('Get Payroll Data', 'Lock the attendance then run the payroll.');
+    }
+  }
+
+  // ---- 6) Load Attendance data (multiple tabs) once ----
+  const attEntry = readTabAsMapByKey_({
+    ss: attSS,
+    tabName: CONST.TABS.ATTENDANCE_ENTRY,
+    keyHeader: CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.ATTENDANCE_ENTRY],
+  });
+
+  const empCodes = attEntry.keys;
+  if (!empCodes.length) {
+    return alert_('Get Payroll Data', 'No employees found in Attendance entry.');
+  }
+
+  const lateMap = readTabAsMapByKey_({
+    ss: attSS,
+    tabName: CONST.TABS.LATE_ENTRY,
+    keyHeader: CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.LATE_ENTRY],
+  }).rowsByKey;
+
+  const otHoursAgg = readSumByKey_({
+    ss: attSS,
+    tabName: CONST.TABS.OT_ENTRY,
+    keyHeader: CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.OT_ENTRY],
+    amountHeader: CONST.MAP['OT Hours']?.targetHeader || 'Total OT Hours',
+  });
+
+  const cfMap = readTabAsMapByKey_({
+    ss: attSS,
+    tabName: CONST.TABS.CARRY_FORWARDED,
+    keyHeader: CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.CARRY_FORWARDED],
+  }).rowsByKey;
+
+  const otherPaymentsAgg = readOtherPaymentsAgg_({
+    ss: attSS,
+    tabName: CONST.TABS.OTHER_PAYMENTS,
+    keyHeader: CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.OTHER_PAYMENTS],
+    amountHeader: CONST.OTHER_PAYMENTS_RULES.AMOUNT_HEADER,
+    considerUnderHeader: CONST.OTHER_PAYMENTS_RULES.CONSIDER_UNDER_HEADER,
+  });
+
+  const otherDedAgg = readSumByKey_({
+    ss: attSS,
+    tabName: CONST.TABS.OTHER_DEDUCTIONS,
+    keyHeader: CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.OTHER_DEDUCTIONS],
+    amountHeader: CONST.MAP['Other Deductions']?.targetHeader || 'Amount',
+  });
+
+  const advDedAgg = readSumByKey_({
+    ss: attSS,
+    tabName: CONST.TABS.SALARY_ADVANCE_DEDUCTIONS,
+    keyHeader: CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.SALARY_ADVANCE_DEDUCTIONS],
+    amountHeader: CONST.MAP['Advance Deduction']?.targetHeader || 'Planned EMI',
+  });
+
+  // ---- 7) Build identity bridge using Employee Master ----
+  const empMasterSS = SpreadsheetApp.openById(CONST.SOURCES.EMPLOYEE_MASTER_SS_ID);
+  const empMasterSheet = empMasterSS.getSheetByName(CONST.TABS.EMPLOYEE_MASTER);
+  if (!empMasterSheet) throw new Error(`Employee Master tab not found: ${CONST.TABS.EMPLOYEE_MASTER}`);
+
+  const empBridge = buildEmployeeCodeToIdMap_(empMasterSheet);
+
+  // ---- 8) Load Revision + Petrol once ----
+  const revSS = SpreadsheetApp.openById(CONST.SOURCES.SALARY_REVISION_HISTORY_SS_ID);
+
+  const revSheet = revSS.getSheetByName(CONST.TABS.REVISION_HISTORY);
+  if (!revSheet) throw new Error(`Revision History tab not found: ${CONST.TABS.REVISION_HISTORY}`);
+  const revisionIndex = buildRevisionIndex_(revSheet);
+
+  const pcSheet = revSS.getSheetByName(CONST.TABS.PETROL_CONVEYANCE_HISTORY);
+  if (!pcSheet) throw new Error(`Petrol Conveyance tab not found: ${CONST.TABS.PETROL_CONVEYANCE_HISTORY}`);
+  const petrolIndex = buildPetrolIndex_(pcSheet);
+
+  // ---- 9) Prepare writer & idempotent clear ----
+  const rowCount = empCodes.length;
+  ensureRowCapacity_(payroll, rowCount + 1);
+
+  clearScriptColumns_(payroll, payrollHeaders, nonScript, rowCount);
+
+  const payrollKeyCol = payIdx.get(norm_(keyPayroll)) + 1;
+  payroll.getRange(2, payrollKeyCol, rowCount, 1).setValues(empCodes.map((c) => [c]));
+
+  const attEntryRows = attEntry.rowsByKey;
+
+  // ---- 9B) Columns whose values are identifiers, not numbers.
+  //          Must never pass through normalizeNumberIfPossible_ (which converts
+  //          digit-strings to JS Number, dropping leading zeros and, for 16+ digit
+  //          values, silently corrupting digits past Number.MAX_SAFE_INTEGER).
+  //          Column is also force-set to Plain Text ('@') before write so Sheets
+  //          never re-parses the written string back into a number on entry. ----
+  const TEXT_PRESERVE_HEADERS = new Set([
+    norm_('Bank Account No'),
+    norm_('UAN No'),
+    norm_('ESI No'),
+    norm_('IFSC Code'),
+  ]);
+
+  // ---- 10) Write script columns per CONST.MAP ----
+  for (const [payColHeader, spec] of Object.entries(CONST.MAP || {})) {
+    const payKey = norm_(payColHeader);
+
+    if (!payIdx.has(payKey)) continue;
+    if (nonScript.has(payKey)) continue;
+
+    if (spec.sheet === 'DATA_VALIDATION') continue;
+    if (spec.sheet === 'MANUAL_OR_RULE') continue;
+
+    const col1Based = payIdx.get(payKey) + 1;
+    const preserveAsText = TEXT_PRESERVE_HEADERS.has(payKey);
+
+    // Force Plain Text format on this column BEFORE writing, for the identifier columns only.
+    if (preserveAsText) {
+      payroll.getRange(2, col1Based, rowCount, 1).setNumberFormat('@');
+    }
+
+    const values = empCodes.map((empCode) => {
+      let v = '';
+
+      if (spec.sheet === 'ATTENDANCE_MONTHLY') {
+        if (spec.tab === CONST.TABS.ATTENDANCE_ENTRY) {
+          v = pickByHeader_(attEntryRows.get(empCode), spec.targetHeader);
+        } else if (spec.tab === CONST.TABS.LATE_ENTRY) {
+          v = pickByHeader_(lateMap.get(empCode), spec.targetHeader);
+        } else if (spec.tab === CONST.TABS.OT_ENTRY) {
+          v = otHoursAgg.get(empCode);
+          if (v === '' || v === null || v === undefined) v = 0;
+        } else if (spec.tab === CONST.TABS.CARRY_FORWARDED) {
+          v = pickByHeader_(cfMap.get(empCode), spec.targetHeader);
+        } else if (spec.tab === CONST.TABS.SALARY_ADVANCE_DEDUCTIONS) {
+          v = advDedAgg.get(empCode);
+          if (v === '' || v === null || v === undefined) v = 0;
+          if (v === '' || v === null || v === undefined) v = 0;
+        } else if (spec.tab === CONST.TABS.OTHER_DEDUCTIONS) {
+          v = otherDedAgg.get(empCode);
+          if (v === '' || v === null || v === undefined) v = 0;
+        } else if (spec.tab === CONST.TABS.OTHER_PAYMENTS) {
+          if (spec.subRule === 'CONSIDER_UNDER=GROSS') v = otherPaymentsAgg.gross.get(empCode);
+          if (spec.subRule === 'CONSIDER_UNDER=NET') v = otherPaymentsAgg.net.get(empCode);
+          if (v === '' || v === null || v === undefined) v = 0;
+        }
+      }
+
+      if (spec.sheet === 'EMPLOYEE_MASTER') {
+        const idno = empBridge.codeToId.get(empCode) || '';
+        v = idno ? empBridge.pick(idno, spec.targetHeader) : '';
+      }
+
+      if (spec.sheet === 'SALARY_REVISION_HISTORY') {
+        const idno = empBridge.codeToId.get(empCode) || '';
+        if (!idno) return [normalizeNumberIfPossible_(defaultNumericIfNeeded_(payColHeader, v))];
+
+        if (spec.tab === CONST.TABS.REVISION_HISTORY) {
+          const chosen = pickRevisionAsOf_(revisionIndex, idno, monthStart);
+          if (!chosen) {
+            v = 0;
+          } else if (spec.subRule === 'EFFECTIVE_FROM_ASOF') {
+            const got = chosen.get(spec.targetHeader);
+            v = (got === '' || got === null || got === undefined) ? 0 : got;
+          } else if (spec.subRule === 'EFFECTIVE_FROM_MATCH_MONTH_ONLY') {
+            const effRaw = chosen.get(CONST.REVISION_RULES.EFFECTIVE_FROM_HEADER);
+            const effDate = (effRaw instanceof Date && !isNaN(effRaw)) ? effRaw : tryParseDate_(effRaw);
+            if (effDate && sameMonth_(effDate, monthStart)) {
+              const got = chosen.get(spec.targetHeader);
+              v = (got === '' || got === null || got === undefined) ? 0 : got;
+            } else {
+              v = 0;
+            }
+          } else {
+            const got = chosen.get(spec.targetHeader);
+            v = (got === '' || got === null || got === undefined) ? 0 : got;
+          }
+        }
+
+        if (spec.tab === CONST.TABS.PETROL_CONVEYANCE_HISTORY) {
+          const got = pickPetrolAsOf_(petrolIndex, idno, monthStart, spec.targetHeader);
+          v = (got === '' || got === null || got === undefined) ? 0 : got;
+        }
+      }
+
+      v = defaultNumericIfNeeded_(payColHeader, v);
+
+      if (preserveAsText) {
+        return [(v === null || v === undefined) ? '' : v];
+      }
+      return [normalizeNumberIfPossible_(v)];
+    });
+
+    payroll.getRange(2, col1Based, rowCount, 1).setValues(values);
+  }
+
+  // ---- 11) Apply Payroll Release Confirmation default without overwriting HOLD ----
+  const prcKey = norm_('Payroll Release Confirmation');
+  if (payIdx.has(prcKey)) {
+    const prcCol = payIdx.get(prcKey) + 1;
+    const existing = payroll.getRange(2, prcCol, rowCount, 1).getDisplayValues().map((r) => (r[0] || '').trim());
+    const out = existing.map((v, i) => {
+      if (empCodes[i] && !v) return ['PROCEED'];
+      return [v];
+    });
+    payroll.getRange(2, prcCol, rowCount, 1).setValues(out);
+  }
+
+  // META: ensure OPEN if blank
+  if (!lockStatus) setMetaValue_(meta, 'LOCK_STATUS', 'OPEN');
+
+  // ---- 12) Protect PAY_ROLL tab after successful data write ----
+  gpdProtectPayrollTab_(ss, payroll, payrollHeaders, monthLabel);
+
+  SpreadsheetApp.flush();
+
+  const successMsg = `Done: Payroll data loaded for ${monthLabel}.`;
+  if (ui) ui.alert('Get Payroll Data', successMsg, ui.ButtonSet.OK);
+  return { success: true, message: successMsg };
+}
+
+/* =========================================================
+   PAY_ROLL TAB PROTECTION
+   Locks everything except:
+   - Payroll Release Confirmation column (rows 2+)
+   - Bank Transfer Mark Down column (rows 2+)
+========================================================= */
+
+function gpdProtectPayrollTab_(ss, payrollSh, payrollHeaders, monthLabel) {
+  const payIdx = buildHeaderIndex_(payrollHeaders);
+
+  const prcKey = norm_('Payroll Release Confirmation');
+  const btmKey = norm_('Bank Transfer Mark Down');
+
+  if (!payIdx.has(prcKey)) throw new Error('PAY_ROLL missing header: Payroll Release Confirmation');
+  if (!payIdx.has(btmKey)) throw new Error('PAY_ROLL missing header: Bank Transfer Mark Down');
+
+  const prcCol = payIdx.get(prcKey) + 1;
+  const btmCol = payIdx.get(btmKey) + 1;
+
+  const maxRows = Math.max(payrollSh.getMaxRows(), payrollSh.getLastRow(), 2);
+
+  // Remove any existing sheet-level protections before applying fresh one
+  const existingProtections = payrollSh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+  existingProtections.forEach((p) => { try { p.remove(); } catch (_) {} });
+
+  const protection = payrollSh.protect();
+  protection.setDescription(`PAYROLL_DATA_LOCK_${monthLabel}__${payrollSh.getName()}`);
+  protection.setWarningOnly(false);
+
+  const releaseRange = payrollSh.getRange(2, prcCol, maxRows - 1, 1);
+  const bankMarkDownRange = payrollSh.getRange(2, btmCol, maxRows - 1, 1);
+  protection.setUnprotectedRanges([releaseRange, bankMarkDownRange]);
+
+  try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+  try { protection.addEditors([GPD_OWNER_EMAIL]); } catch (_) {}
+  try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+}
+
+/* ===========================
+   Helper — extract spreadsheet ID from link or raw ID
+=========================== */
+
+function extractSpreadsheetId_(s) {
+  const t = String(s || '').trim();
+  if (!t) return '';
+
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(t)) return t;
+
+  const m = t.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]{20,})/);
+  return m ? m[1] : '';
+}
+
+/* ===========================
+   Helpers — META_DATA
+=========================== */
+
+function getMetaValue_(metaSheet, key) {
+  const data = metaSheet.getRange(1, 1, metaSheet.getLastRow(), 2).getDisplayValues();
+  const k = norm_(key);
+  for (let i = 1; i < data.length; i++) {
+    if (norm_(data[i][0]) === k) return data[i][1];
+  }
+  return '';
+}
+
+function setMetaValue_(metaSheet, key, value) {
+  const data = metaSheet.getRange(1, 1, metaSheet.getLastRow(), 2).getDisplayValues();
+  const k = norm_(key);
+  for (let i = 1; i < data.length; i++) {
+    if (norm_(data[i][0]) === k) {
+      metaSheet.getRange(i + 1, 2).setValue(value);
+      return;
+    }
+  }
+  metaSheet.appendRow([key, value]);
+}
+
+/* ===========================
+   Helpers — Parsing month
+=========================== */
+
+function parsePayrollMonthFromName_(name) {
+  const m = String(name || '').match(/Payroll-Workings[_\s-]+([A-Za-z]+)[_\s-]+(\d{4})/i);
+  if (!m) return null;
+
+  const monthName = m[1];
+  const year = parseInt(m[2], 10);
+
+  const monthIndex = monthNameToIndex_(monthName);
+  if (monthIndex === null) return null;
+
+  const monthStart = new Date(year, monthIndex, 1);
+  const monthLabel = `${capitalize_(monthName)}_${year}`;
+  return { monthLabel, monthStart };
+}
+
+function monthNameToIndex_(mn) {
+  const map = {
+    JANUARY: 0, FEBRUARY: 1, MARCH: 2, APRIL: 3, MAY: 4, JUNE: 5,
+    JULY: 6, AUGUST: 7, SEPTEMBER: 8, OCTOBER: 9, NOVEMBER: 10, DECEMBER: 11,
+  };
+  const k = String(mn || '').trim().toUpperCase();
+  return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null;
+}
+
+function capitalize_(s) {
+  const t = String(s || '').trim().toLowerCase();
+  return t ? t[0].toUpperCase() + t.slice(1) : '';
+}
+
+function sameMonth_(a, b) {
+  if (!(a instanceof Date) || isNaN(a)) return false;
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+}
+
+/* ===========================
+   Helpers — Headers and mapping
+=========================== */
+
+function norm_(h) {
+  return String(h || '').trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
+function buildHeaderIndex_(headers) {
+  const m = new Map();
+  headers.forEach((h, i) => m.set(norm_(h), i));
+  return m;
+}
+
+function pickByHeader_(rowObj, header) {
+  if (!rowObj || !header) return '';
+  const k = norm_(header);
+  return Object.prototype.hasOwnProperty.call(rowObj, k) ? rowObj[k] : '';
+}
+
+/* ===========================
+   Helpers — Read attendance tabs
+=========================== */
+
+function readTabAsMapByKey_({ ss, tabName, keyHeader }) {
+  const sh = ss.getSheetByName(tabName);
+  if (!sh) throw new Error(`Attendance tab not found: ${tabName}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return { keys: [], rowsByKey: new Map() };
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const hIdx = buildHeaderIndex_(headers);
+
+  const keyK = norm_(keyHeader);
+  if (!hIdx.has(keyK)) throw new Error(`Tab "${tabName}" missing key header: ${keyHeader}`);
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  const rowsByKey = new Map();
+  const keys = [];
+
+  data.forEach((r) => {
+    const key = String(r[hIdx.get(keyK)] || '').trim();
+    if (!key) return;
+
+    const obj = {};
+    headers.forEach((h, i) => (obj[norm_(h)] = r[i]));
+    if (!rowsByKey.has(key)) keys.push(key);
+    rowsByKey.set(key, obj);
+  });
+
+  return { keys, rowsByKey };
+}
+
+function readOtherPaymentsAgg_({ ss, tabName, keyHeader, amountHeader, considerUnderHeader }) {
+  const sh = ss.getSheetByName(tabName);
+  if (!sh) throw new Error(`Attendance tab not found: ${tabName}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  const gross = new Map();
+  const net = new Map();
+
+  if (lastRow < 2 || lastCol < 1) return { gross, net };
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const hIdx = buildHeaderIndex_(headers);
+
+  const kKey = norm_(keyHeader);
+  const kAmt = norm_(amountHeader);
+  const kCU = norm_(considerUnderHeader);
+
+  if (!hIdx.has(kKey)) throw new Error(`Tab "${tabName}" missing key header: ${keyHeader}`);
+  if (!hIdx.has(kAmt)) throw new Error(`Tab "${tabName}" missing Amount header: ${amountHeader}`);
+  if (!hIdx.has(kCU)) throw new Error(`Tab "${tabName}" missing Consider Under header: ${considerUnderHeader}`);
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  data.forEach((r) => {
+    const emp = String(r[hIdx.get(kKey)] || '').trim();
+    if (!emp) return;
+
+    const cu = String(r[hIdx.get(kCU)] || '').trim().toUpperCase();
+    const amt = toNumber_(r[hIdx.get(kAmt)]);
+    if (!amt) return;
+
+    if (cu === CONST.OTHER_PAYMENTS_RULES.CONSIDER_UNDER_VALUES.GROSS) {
+      gross.set(emp, (gross.get(emp) || 0) + amt);
+    } else if (cu === CONST.OTHER_PAYMENTS_RULES.CONSIDER_UNDER_VALUES.NET) {
+      net.set(emp, (net.get(emp) || 0) + amt);
+    }
+  });
+
+  return { gross, net };
+}
+
+function readSumByKey_({ ss, tabName, keyHeader, amountHeader }) {
+  const sh = ss.getSheetByName(tabName);
+  if (!sh) throw new Error(`Attendance tab not found: ${tabName}`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  const out = new Map();
+
+  if (lastRow < 2 || lastCol < 1) return out;
+
+  const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const hIdx = buildHeaderIndex_(headers);
+
+  const kKey = norm_(keyHeader);
+  const kAmt = norm_(amountHeader);
+
+  if (!hIdx.has(kKey)) throw new Error(`Tab "${tabName}" missing key header: ${keyHeader}`);
+  if (!hIdx.has(kAmt)) throw new Error(`Tab "${tabName}" missing Amount header: ${amountHeader}`);
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  data.forEach((r) => {
+    const emp = String(r[hIdx.get(kKey)] || '').trim();
+    if (!emp) return;
+    const amt = toNumber_(r[hIdx.get(kAmt)]);
+    if (!amt) return;
+    out.set(emp, (out.get(emp) || 0) + amt);
+  });
+
+  return out;
+}
+
+/* ===========================
+   Helpers — Employee master identity bridge
+=========================== */
+
+function buildEmployeeCodeToIdMap_(empMasterSheet) {
+  const lastRow = empMasterSheet.getLastRow();
+  const lastCol = empMasterSheet.getLastColumn();
+  if (lastRow < 2) throw new Error('Employee Master has no data.');
+
+  const headers = empMasterSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const hIdx = buildHeaderIndex_(headers);
+
+  const idKey = norm_('ID.NO');
+  if (!hIdx.has(idKey)) throw new Error('Employee Master must contain "ID.NO" column.');
+
+  const data = empMasterSheet.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  const codeToId = new Map();
+  const byId = new Map();
+
+  data.forEach((r) => {
+    const idno = String(r[hIdx.get(idKey)] || '').trim();
+    if (!idno) return;
+
+    const obj = {};
+    headers.forEach((h, i) => (obj[norm_(h)] = r[i]));
+    byId.set(idno, obj);
+    codeToId.set(idno, idno);
+  });
+
+  const pick = (idno, header) => {
+    const row = byId.get(idno);
+    if (!row) return '';
+    return row[norm_(header)] ?? '';
+  };
+
+  return { codeToId, pick };
+}
+
+/* ===========================
+   Helpers — Revision + Petrol
+=========================== */
+
+function buildRevisionIndex_(revSheet) {
+  const lastRow = revSheet.getLastRow();
+  const lastCol = revSheet.getLastColumn();
+  if (lastRow < 2) return { byId: new Map() };
+
+  const headers = revSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const hIdx = buildHeaderIndex_(headers);
+
+  const idKey = norm_('ID.NO');
+  const effKey = norm_(CONST.REVISION_RULES.EFFECTIVE_FROM_HEADER);
+  const statusKey = norm_('APPROVAL_STATUS');
+  const approvedOnKey = norm_('APPROVED_ON');
+
+  if (!hIdx.has(idKey)) throw new Error('REVISION_HISTORY missing ID.NO');
+  if (!hIdx.has(effKey)) throw new Error(`REVISION_HISTORY missing ${CONST.REVISION_RULES.EFFECTIVE_FROM_HEADER}`);
+  if (!hIdx.has(statusKey)) throw new Error('REVISION_HISTORY missing APPROVAL_STATUS');
+
+  const data = revSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  const byId = new Map();
+
+  data.forEach((r, idx0) => {
+    const idno = String(r[hIdx.get(idKey)] || '').trim();
+    if (!idno) return;
+
+    const approval = String(r[hIdx.get(statusKey)] || '').trim().toUpperCase();
+    if (approval !== 'APPROVED') return;
+
+    const eff = r[hIdx.get(effKey)];
+    const effDate = (eff instanceof Date && !isNaN(eff)) ? eff : tryParseDate_(eff);
+    if (!effDate) return;
+
+    const approvedOnVal = hIdx.has(approvedOnKey) ? r[hIdx.get(approvedOnKey)] : null;
+    const approvedOn = (approvedOnVal instanceof Date && !isNaN(approvedOnVal)) ? approvedOnVal : null;
+
+    const get = (headerName) => {
+      const nk = norm_(headerName);
+      const pos = hIdx.get(nk);
+      return pos === undefined ? '' : r[pos];
+    };
+
+    const item = { idno, effDate, approvedOn, rowOrder: idx0, get };
+
+    if (!byId.has(idno)) byId.set(idno, []);
+    byId.get(idno).push(item);
+  });
+
+  byId.forEach((list) => {
+    list.sort((a, b) => {
+      const de = a.effDate.getTime() - b.effDate.getTime();
+      if (de !== 0) return de;
+      const ao = (a.approvedOn ? a.approvedOn.getTime() : 0) - (b.approvedOn ? b.approvedOn.getTime() : 0);
+      if (ao !== 0) return ao;
+      return a.rowOrder - b.rowOrder;
+    });
+  });
+
+  return { byId };
+}
+
+function pickRevisionAsOf_(revisionIndex, idno, monthStart) {
+  const list = revisionIndex.byId.get(idno);
+  if (!list || !list.length) return null;
+
+  const t = monthStart.getTime();
+  let best = null;
+  for (const item of list) {
+    if (item.effDate.getTime() <= t) best = item;
+    else break;
+  }
+  return best;
+}
+
+function buildPetrolIndex_(pcSheet) {
+  const lastRow = pcSheet.getLastRow();
+  const lastCol = pcSheet.getLastColumn();
+  if (lastRow < 2) return { byId: new Map(), hasEff: false };
+
+  const headers = pcSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const hIdx = buildHeaderIndex_(headers);
+
+  const idKey = norm_('ID.NO');
+  const effKey = norm_(CONST.REVISION_RULES.EFFECTIVE_FROM_HEADER);
+  const statusKey = norm_('APPROVAL_STATUS');
+
+  if (!hIdx.has(idKey)) throw new Error('PETROL-CONVEYANCE_HISTORY missing ID.NO');
+  if (!hIdx.has(effKey)) throw new Error(`PETROL-CONVEYANCE_HISTORY missing ${CONST.REVISION_RULES.EFFECTIVE_FROM_HEADER}`);
+  if (!hIdx.has(statusKey)) throw new Error('PETROL-CONVEYANCE_HISTORY missing APPROVAL_STATUS');
+
+  const data = pcSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  const byId = new Map();
+
+  data.forEach((r, idx0) => {
+    const idno = String(r[hIdx.get(idKey)] || '').trim();
+    if (!idno) return;
+
+    const approval = String(r[hIdx.get(statusKey)] || '').trim().toUpperCase();
+    if (approval !== 'APPROVED') return;
+
+    const effVal = r[hIdx.get(effKey)];
+    const effDate = (effVal instanceof Date && !isNaN(effVal)) ? effVal : tryParseDate_(effVal);
+    if (!effDate) return;
+
+    const get = (headerName) => {
+      const nk = norm_(headerName);
+      const pos = hIdx.get(nk);
+      return pos === undefined ? '' : r[pos];
+    };
+
+    const item = { idno, effDate, rowOrder: idx0, get };
+
+    if (!byId.has(idno)) byId.set(idno, []);
+    byId.get(idno).push(item);
+  });
+
+  byId.forEach((list) => {
+    list.sort((a, b) => {
+      const de = a.effDate.getTime() - b.effDate.getTime();
+      if (de !== 0) return de;
+      return a.rowOrder - b.rowOrder;
+    });
+  });
+
+  return { byId, hasEff: true };
+}
+
+function pickPetrolAsOf_(petrolIndex, idno, monthStart, valueHeader) {
+  const list = petrolIndex.byId.get(idno);
+  if (!list || !list.length) return '';
+
+  const t = monthStart.getTime();
+  let best = null;
+  for (const item of list) {
+    if (item.effDate.getTime() <= t) best = item;
+    else break;
+  }
+  return best ? best.get(valueHeader) : '';
+}
+
+/* ===========================
+   Helpers — Idempotent writes
+=========================== */
+
+function clearScriptColumns_(payrollSheet, payrollHeaders, nonScriptSet, rowCount) {
+  const hdrIdx = buildHeaderIndex_(payrollHeaders);
+
+  Object.keys(CONST.MAP || {}).forEach((payCol) => {
+    const k = norm_(payCol);
+    if (!hdrIdx.has(k)) return;
+    if (nonScriptSet.has(k)) return;
+
+    const spec = CONST.MAP[payCol];
+    if (spec.sheet === 'DATA_VALIDATION') return;
+    if (spec.sheet === 'MANUAL_OR_RULE') return;
+
+    const col = hdrIdx.get(k) + 1;
+    payrollSheet.getRange(2, col, rowCount, 1).clearContent();
+  });
+
+  const keyCol = hdrIdx.get(norm_(CONST.KEYS.PAYROLL)) + 1;
+  payrollSheet.getRange(2, keyCol, rowCount, 1).clearContent();
+}
+
+function ensureRowCapacity_(sheet, neededRows) {
+  const max = sheet.getMaxRows();
+  if (max < neededRows) sheet.insertRowsAfter(max, neededRows - max);
+}
+
+/* ===========================
+   Helpers — Numeric defaults
+=========================== */
+
+function defaultNumericIfNeeded_(payHeader, currentVal) {
+  const k = norm_(payHeader);
+  const numericHeaders = new Set([
+    norm_('Basic'),
+    norm_('DA'),
+    norm_('HRA'),
+    norm_('Conveyance Allowance'),
+    norm_('Special Allowance'),
+    norm_('Increment'),
+    norm_('Petrol Conveyance'),
+    norm_('Other Payments [Gross]'),
+    norm_('Other Payments [Net]'),
+    norm_('Other Deductions'),
+    norm_('Advance Deduction'),
+  ]);
+  if (!numericHeaders.has(k)) return currentVal;
+  if (currentVal === '' || currentVal === null || currentVal === undefined) return 0;
+  return currentVal;
+}
+
+/* ===========================
+   Helpers — Numbers & Dates
+=========================== */
+
+function toNumber_(v) {
+  const s = String(v || '').replace(/[,₹% ]/g, '').trim();
+  if (!s) return 0;
+  const n = Number(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function normalizeNumberIfPossible_(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v).trim();
+  if (s === '') return '';
+
+  const n = toNumber_(s);
+  if (n === 0 && s !== '0' && s !== '0.0' && s !== '0.00') return v;
+  return n;
+}
+
+function tryParseDate_(v) {
+  if (v instanceof Date && !isNaN(v)) return v;
+
+  const raw = String(v || '').trim();
+  if (!raw) return null;
+
+  const s = raw.replace(/[-]+/g, ' ').replace(/_+/g, ' ').replace(/\s+/g, ' ').trim();
+  const m = s.match(/^([A-Za-z]+)\s+(\d{4})$/);
+  if (m) {
+    const monthIndex = monthNameToIndex_(m[1]);
+    const year = parseInt(m[2], 10);
+    if (monthIndex !== null && !isNaN(year)) return new Date(year, monthIndex, 1);
+  }
+
+  const d = new Date(raw);
+  return isNaN(d) ? null : d;
+}

@@ -1,0 +1,27 @@
+/*******************************************************
+ * PAYSLIP EMAIL — MENU
+ *
+ * Adds one menu to the monthly Payslip_<Month> file. This project
+ * is bound to the Template Payslip file, so makeCopy() carries
+ * this onOpen into every monthly copy automatically.
+ *
+ * "Get Staff Emails" runs first — it fills blank Email cells on
+ * Staff Email Master and stamps _GENERATED_LOG!F1. "Send Staff
+ * Payslip Emails" checks for that stamp before it will send
+ * anything.
+ *
+ * NOTE:
+ * - Keep ONLY ONE onOpen() in THIS project.
+ * - This is a separate Apps Script project from PAYROLL_GEN_3's
+ *   onOpen (which lives on the Payroll Workings spreadsheet, a
+ *   different file entirely) — no conflict between the two.
+ *******************************************************/
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  ui.createMenu('Payslip Email')
+    .addItem('Get Staff Emails', 'getStaffEmails')
+    .addItem('Send Staff Payslip Emails', 'sendStaffPayslipEmails')
+    .addToUi();
+}

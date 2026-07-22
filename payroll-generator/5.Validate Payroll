@@ -1,0 +1,559 @@
+/**
+ * Validate Payroll (Revision-only fixed salary cross-check)
+ * - Precheck: META_DATA -> ATTENDANCE_VALIDATION must contain "VALIDATED"
+ * - Precheck: META_DATA -> PAYROLL_MONTH_LABEL must be valid
+ * - Precheck: META_DATA Check col -> "Employees with ZERO Gross" (col F) must equal 0
+ * - Copies employee master fields from PAY_ROLL into FIXED_SALARY_CHECK
+ * - Fetches Basic/DA/HRA/Conveyance Allowance/Special Allowance from REVISION_HISTORY
+ *   using EFFECTIVE_FROM <= payroll month start + latest APPROVED rule
+ * - Does NOT touch your Get Payroll Data logic
+ * - Does NOT overwrite formula columns (e.g., Basic+DA, Gross) in FIXED_SALARY_CHECK
+ *
+ * USER GATE:
+ * ✅ pmo@butlerleather.com       → runs directly
+ * ✅ nazneen@butlerleather.com   → runs via Web App (as owner)
+ * ✅ Others                      → blocked
+ *
+ * On success:
+ * ✅ FIXED_SALARY_CHECK tab is fully protected (pmo owner only)
+ */
+
+const VP_OWNER_EMAIL   = 'pmo@butlerleather.com';
+const VP_ALLOWED_EMAIL = 'nazneen@butlerleather.com';
+
+/* =========================================================
+   ENTRY POINT
+========================================================= */
+
+function validatePayroll() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    // ── Owner: run directly ──
+    if (currentUser === VP_OWNER_EMAIL.toLowerCase()) {
+      validatePayrollServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      return;
+    }
+
+    // ── Allowed user: call Web App (runs as owner) ──
+    if (currentUser === VP_ALLOWED_EMAIL.toLowerCase()) {
+      if (!GLP_WEBAPP_URL || GLP_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert(
+          'Validate Payroll',
+          'Web App URL is not configured. Please deploy the Web App and paste the URL in GLP_WEBAPP_URL.',
+          ui.ButtonSet.OK
+        );
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(GLP_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'validatePayroll',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      if (result.message) {
+        ui.alert('Validate Payroll', result.message, ui.ButtonSet.OK);
+      }
+      return;
+    }
+
+    // ── Anyone else: blocked ──
+    ui.alert(
+      'Validate Payroll',
+      'You are not authorized to run this function.',
+      ui.ButtonSet.OK
+    );
+
+  } catch (err) {
+    ui.alert(
+      'Validate Payroll',
+      `Error: ${err && err.message ? err.message : err}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function validatePayrollServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  const runMode       = String(payload.runMode || 'webapp').trim();
+
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+
+  let ui = null;
+  if (runMode === 'direct') {
+    try { ui = SpreadsheetApp.getUi(); } catch (_) { ui = null; }
+  }
+
+  const alert_ = (title, msg) => {
+    if (ui) ui.alert(title, msg, ui.ButtonSet.OK);
+    return { success: false, message: msg };
+  };
+
+  // ---- Sheet names (update only if your names differ) ----
+  const PAYROLL_SHEET_NAME  = 'PAY_ROLL';
+  const META_SHEET_NAME     = 'META_DATA';
+  const CHECK_SHEET_NAME    = 'FIXED_SALARY_CHECK';
+
+  // ---- Fixed source: Salary Revision History ----
+  const REVISION_SS_ID      = '1XsyWVct4LOVMvZMDq4EThD6mgoAoumN-_RNQiwy67KM';
+  const REVISION_SHEET_NAME = 'REVISION_HISTORY';
+
+  const payrollSh = ss.getSheetByName(PAYROLL_SHEET_NAME);
+  const metaSh    = ss.getSheetByName(META_SHEET_NAME);
+  const checkSh   = ss.getSheetByName(CHECK_SHEET_NAME);
+
+  if (!payrollSh || !metaSh || !checkSh) {
+    return alert_(
+      'Validate Payroll',
+      'Missing required sheet(s). Expected: PAY_ROLL, META_DATA, FIXED_SALARY_CHECK.'
+    );
+  }
+
+  // ----------------------------
+  // 1) Precheck: Attendance validated
+  // ----------------------------
+  const meta                 = getMetaKeyValueMap_(metaSh);
+  const attendanceValidation = String(meta['ATTENDANCE_VALIDATION'] || '').trim();
+
+  if (!attendanceValidation || attendanceValidation.toUpperCase().indexOf('VALIDATED') === -1) {
+    return alert_(
+      'Validate Payroll',
+      'Attendance is NOT validated.\n\nPlease run "Validate Attendance" first (or ask HR to validate attendance), then try again.'
+    );
+  }
+
+  // ----------------------------
+  // 1a) Precheck: Payroll month label is valid
+  // ----------------------------
+  const payrollMonthLabel = String(meta['PAYROLL_MONTH_LABEL'] || '').trim();
+  const payrollMonthStart = parseMonthYearLabelToMonthStart_(payrollMonthLabel);
+  if (!payrollMonthStart) {
+    return alert_(
+      'Validate Payroll',
+      'PAYROLL_MONTH_LABEL is missing/invalid in META_DATA.\nExpected format like "April_2025" or "Apr_2025".'
+    );
+  }
+
+  // ----------------------------
+  // 1b) Precheck: Employees with ZERO Gross must be 0
+  // ----------------------------
+  const zeroGrossValue = getMetaCheckValue_(metaSh, 'Employees with ZERO Gross');
+
+  if (zeroGrossValue === null) {
+    return alert_(
+      'Validate Payroll',
+      '"Employees with ZERO Gross" row not found in META_DATA Check column.\nPlease check your META_DATA layout.'
+    );
+  }
+
+  if (Number(String(zeroGrossValue).replace(/,/g, '').trim()) !== 0) {
+    return alert_(
+      'Validate Payroll',
+      `Validation failed: ${zeroGrossValue} employee(s) have ZERO Gross salary.\n\nPlease fix all zero-gross employees in PAY_ROLL before proceeding.`
+    );
+  }
+
+  // ----------------------------
+  // 2) Read PAY_ROLL: pull employee list fields
+  // ----------------------------
+  const payrollValues = payrollSh.getDataRange().getDisplayValues();
+  if (payrollValues.length < 2) {
+    return alert_('Validate Payroll', 'PAY_ROLL has no data rows.');
+  }
+
+  const pHdr = buildHeaderIndexMap_(payrollValues[0]);
+  const requiredPayrollHeaders = [
+    'S.No',
+    'Employee Code',
+    'Name',
+    'Gender',
+    'Category',
+    'Date Of Joining',
+    'Department',
+    'Designation',
+  ];
+
+  const missingPH = requiredPayrollHeaders.filter(h => pHdr[h] == null);
+  if (missingPH.length) {
+    return alert_(
+      'Validate Payroll',
+      'PAY_ROLL is missing required header(s):\n- ' + missingPH.join('\n- ')
+    );
+  }
+
+  const payrollRows = [];
+  for (let r = 1; r < payrollValues.length; r++) {
+    const row     = payrollValues[r];
+    const empCode = String(row[pHdr['Employee Code']] || '').trim();
+    if (!empCode) continue;
+
+    payrollRows.push({
+      sno:      row[pHdr['S.No']],
+      empCode,
+      name:     row[pHdr['Name']],
+      gender:   row[pHdr['Gender']],
+      category: row[pHdr['Category']],
+      doj:      row[pHdr['Date Of Joining']],
+      dept:     row[pHdr['Department']],
+      desig:    row[pHdr['Designation']],
+    });
+  }
+
+  if (!payrollRows.length) {
+    return alert_('Validate Payroll', 'No Employee Code found in PAY_ROLL.');
+  }
+
+  // ----------------------------
+  // 3) Read REVISION_HISTORY and build per-employee latest APPROVED <= monthStart
+  // ----------------------------
+  const revSS = SpreadsheetApp.openById(REVISION_SS_ID);
+  const revSh = revSS.getSheetByName(REVISION_SHEET_NAME);
+  if (!revSh) {
+    return alert_('Validate Payroll', 'REVISION_HISTORY sheet not found in Salary Revision History file.');
+  }
+
+  const revValues = revSh.getDataRange().getDisplayValues();
+  if (revValues.length < 2) {
+    return alert_('Validate Payroll', 'REVISION_HISTORY has no data.');
+  }
+
+  const rHdr = buildHeaderIndexMap_(revValues[0]);
+
+  const requiredRevHeaders = [
+    'ID.NO',
+    'APPROVAL_STATUS',
+    'EFFECTIVE_FROM',
+    'BASIC',
+    'DA',
+    'HRA',
+    'CONV.ALL',
+    'SPL.ALL',
+  ];
+
+  const missingRH = requiredRevHeaders.filter(h => rHdr[h] == null);
+  if (missingRH.length) {
+    return alert_(
+      'Validate Payroll',
+      'REVISION_HISTORY is missing required header(s):\n- ' + missingRH.join('\n- ')
+    );
+  }
+
+  const latestApprovedMap = buildLatestApprovedRevisionMap_(
+    revValues,
+    rHdr,
+    payrollMonthStart
+  );
+
+  // ----------------------------
+  // 4) Write FIXED_SALARY_CHECK (do not overwrite formula columns)
+  // ----------------------------
+  const checkValues = checkSh.getDataRange().getDisplayValues();
+  if (!checkValues.length) {
+    return alert_('Validate Payroll', 'FIXED_SALARY_CHECK has no header row.');
+  }
+
+  const cHdr = buildHeaderIndexMap_(checkValues[0]);
+
+  const requiredCheckHeaders = [
+    'S.No',
+    'Employee Code',
+    'Name',
+    'Gender',
+    'Category',
+    'Date Of Joining',
+    'Department',
+    'Designation',
+    'Basic',
+    'DA',
+    'HRA',
+    'Conveyance Allowance',
+    'Special Allowance',
+  ];
+
+  const missingCH = requiredCheckHeaders.filter(h => cHdr[h] == null);
+  if (missingCH.length) {
+    return alert_(
+      'Validate Payroll',
+      'FIXED_SALARY_CHECK is missing required header(s):\n- ' + missingCH.join('\n- ')
+    );
+  }
+
+  let noApprovedRevisionCount = 0;
+
+  const writeByHeader = {
+    'S.No':                 [],
+    'Employee Code':        [],
+    'Name':                 [],
+    'Gender':               [],
+    'Category':             [],
+    'Date Of Joining':      [],
+    'Department':           [],
+    'Designation':          [],
+    'Basic':                [],
+    'DA':                   [],
+    'HRA':                  [],
+    'Conveyance Allowance': [],
+    'Special Allowance':    [],
+  };
+
+  for (let i = 0; i < payrollRows.length; i++) {
+    const pr     = payrollRows[i];
+    const picked = latestApprovedMap[pr.empCode] || null;
+
+    const basic = picked ? picked.basic : 0;
+    const da    = picked ? picked.da    : 0;
+    const hra   = picked ? picked.hra   : 0;
+    const conv  = picked ? picked.conv  : 0;
+    const spl   = picked ? picked.spl   : 0;
+
+    if (!picked) noApprovedRevisionCount++;
+
+    writeByHeader['S.No'].push([pr.sno]);
+    writeByHeader['Employee Code'].push([pr.empCode]);
+    writeByHeader['Name'].push([pr.name]);
+    writeByHeader['Gender'].push([pr.gender]);
+    writeByHeader['Category'].push([pr.category]);
+    writeByHeader['Date Of Joining'].push([pr.doj]);
+    writeByHeader['Department'].push([pr.dept]);
+    writeByHeader['Designation'].push([pr.desig]);
+    writeByHeader['Basic'].push([basic]);
+    writeByHeader['DA'].push([da]);
+    writeByHeader['HRA'].push([hra]);
+    writeByHeader['Conveyance Allowance'].push([conv]);
+    writeByHeader['Special Allowance'].push([spl]);
+  }
+
+  // Clear only the script-managed columns (not formulas)
+  const maxRows = checkSh.getMaxRows();
+  if (maxRows >= 2) {
+    clearColumnsByHeader_(checkSh, cHdr, requiredCheckHeaders, 2, maxRows);
+  }
+
+  // Write only the script-managed columns, so formula columns remain untouched
+  const startRow    = 2;
+  const outRowCount = payrollRows.length;
+  if (outRowCount > 0) {
+    requiredCheckHeaders.forEach(h => {
+      const idx = cHdr[h];
+      if (idx == null) return;
+      checkSh.getRange(startRow, idx + 1, outRowCount, 1).setValues(writeByHeader[h]);
+    });
+  }
+
+  // ---- 5) Protect FIXED_SALARY_CHECK tab (entire tab, pmo owner only) ----
+  vpProtectFixedSalaryCheckTab_(ss, payrollMonthLabel);
+
+  SpreadsheetApp.flush();
+
+  const msg =
+    'Validate Payroll completed.\n\n' +
+    'Employees checked: ' + outRowCount + '\n' +
+    'Employees with NO approved revision for this month: ' + noApprovedRevisionCount + '\n\n' +
+    'Now review your Control Panel totals and proceed only if mismatch = 0.';
+
+  if (ui) ui.alert('Validate Payroll', msg, ui.ButtonSet.OK);
+  return { success: true, message: msg };
+}
+
+/* =========================================================
+   FIXED_SALARY_CHECK TAB PROTECTION
+   Locks entire tab — only pmo retains edit access
+========================================================= */
+
+function vpProtectFixedSalaryCheckTab_(ss, monthLabel) {
+  const tabName = 'FIXED_SALARY_CHECK';
+  const sh = ss.getSheetByName(tabName);
+  if (!sh) return; // tab absent → skip silently
+
+  // Remove any existing sheet-level protections first
+  const existing = sh.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+  existing.forEach((p) => { try { p.remove(); } catch (_) {} });
+
+  const protection = sh.protect();
+  protection.setDescription(`FIXED_SALARY_CHECK_LOCK_${monthLabel}`);
+  protection.setWarningOnly(false);
+
+  // No unprotected ranges — full lock
+  try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+  try { protection.addEditors([VP_OWNER_EMAIL]); } catch (_) {}
+  try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+}
+
+/* =========================
+   Helpers (local, safe — unchanged)
+   ========================= */
+
+function getMetaKeyValueMap_(metaSh) {
+  const values = metaSh.getRange(1, 1, metaSh.getLastRow(), 2).getDisplayValues();
+  const map    = {};
+  for (let i = 0; i < values.length; i++) {
+    const key = String(values[i][0] || '').trim();
+    if (!key) continue;
+    map[key] = values[i][1];
+  }
+  return map;
+}
+
+/**
+ * Reads META_DATA columns E (Check) and F (Payroll Status).
+ * Returns the Payroll Status value for the given checkLabel, or null if not found.
+ * Column E = index 5, Column F = index 6 (1-based).
+ */
+function getMetaCheckValue_(metaSh, checkLabel) {
+  const lastRow = metaSh.getLastRow();
+  if (lastRow < 2) return null;
+
+  // Columns E=5, F=6 (1-based)
+  const values = metaSh.getRange(1, 5, lastRow, 2).getDisplayValues();
+
+  for (let i = 0; i < values.length; i++) {
+    const label = String(values[i][0] || '').trim();
+    if (label.toLowerCase() === checkLabel.toLowerCase()) {
+      return String(values[i][1] || '').trim();
+    }
+  }
+  return null;
+}
+
+function buildHeaderIndexMap_(headerRow) {
+  const m = {};
+  for (let c = 0; c < headerRow.length; c++) {
+    const h = String(headerRow[c] || '').trim();
+    if (!h) continue;
+    m[h] = c;
+  }
+  return m;
+}
+
+function parseMonthYearLabelToMonthStart_(label) {
+  if (!label) return null;
+  const s     = String(label).trim();
+  const parts = s.split('_');
+  if (parts.length !== 2) return null;
+
+  const monthPart = parts[0].trim().toLowerCase();
+  const yearPart  = parts[1].trim();
+
+  const year = Number(yearPart);
+  if (!year || year < 1900) return null;
+
+  const months = {
+    jan: 0, january: 0,
+    feb: 1, february: 1,
+    mar: 2, march: 2,
+    apr: 3, april: 3,
+    may: 4,
+    jun: 5, june: 5,
+    jul: 6, july: 6,
+    aug: 7, august: 7,
+    sep: 8, sept: 8, september: 8,
+    oct: 9, october: 9,
+    nov: 10, november: 10,
+    dec: 11, december: 11,
+  };
+
+  const m = months[monthPart];
+  if (m == null) return null;
+
+  return new Date(year, m, 1);
+}
+
+function buildLatestApprovedRevisionMap_(revValues, rHdr, payrollMonthStart) {
+  const map = {};
+
+  for (let r = 1; r < revValues.length; r++) {
+    const row = revValues[r];
+
+    const emp = String(row[rHdr['ID.NO']] || '').trim();
+    if (!emp) continue;
+
+    const status = String(row[rHdr['APPROVAL_STATUS']] || '').trim().toUpperCase();
+    if (status !== 'APPROVED') continue;
+
+    const effLabel = String(row[rHdr['EFFECTIVE_FROM']] || '').trim();
+    const effDate  = parseMonthYearLabelToMonthStart_(effLabel);
+    if (!effDate) continue;
+
+    if (effDate.getTime() > payrollMonthStart.getTime()) continue;
+
+    const approvedOn = rHdr['APPROVED_ON'] == null
+      ? null
+      : parseGenericDateValue_(row[rHdr['APPROVED_ON']]);
+
+    const current = {
+      effDate,
+      approvedOn,
+      rowOrder: r,
+      basic: toNumber_(row[rHdr['BASIC']]),
+      da:    toNumber_(row[rHdr['DA']]),
+      hra:   toNumber_(row[rHdr['HRA']]),
+      conv:  toNumber_(row[rHdr['CONV.ALL']]),
+      spl:   toNumber_(row[rHdr['SPL.ALL']]),
+    };
+
+    const prev = map[emp];
+
+    if (!prev) {
+      map[emp] = current;
+      continue;
+    }
+
+    const currEffMs      = current.effDate.getTime();
+    const prevEffMs      = prev.effDate.getTime();
+    const currApprovedMs = current.approvedOn ? current.approvedOn.getTime() : 0;
+    const prevApprovedMs = prev.approvedOn    ? prev.approvedOn.getTime()    : 0;
+
+    if (
+      currEffMs > prevEffMs ||
+      (currEffMs === prevEffMs && currApprovedMs > prevApprovedMs) ||
+      (currEffMs === prevEffMs && currApprovedMs === prevApprovedMs && current.rowOrder > prev.rowOrder)
+    ) {
+      map[emp] = current;
+    }
+  }
+
+  return map;
+}
+
+function parseGenericDateValue_(v) {
+  const s = String(v || '').trim();
+  if (!s) return null;
+
+  const d = new Date(s);
+  return isNaN(d) ? null : d;
+}
+
+function toNumber_(v) {
+  const s = String(v || '').replace(/,/g, '').trim();
+  if (!s) return 0;
+  const n = Number(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function clearColumnsByHeader_(sheet, headerMap, headersToClear, startRow, endRow) {
+  const numRows = endRow - startRow + 1;
+  headersToClear.forEach(h => {
+    const idx = headerMap[h];
+    if (idx == null) return;
+    sheet.getRange(startRow, idx + 1, numRows, 1).clearContent();
+  });
+}

@@ -1,0 +1,379 @@
+/************************************************
+ * Revision_Approval.gs
+ * Salary Revision — Spreadsheet-bound Apps Script
+ *
+ * revisionApproval()        — entry point called by Menu.gs
+ *                             user gate: pmo runs core directly,
+ *                             nazneen routes via Web App, others blocked
+ * revisionApprovalCore_()   — core logic + reissued-code Salary Fixation hold guardrail
+ * revisionApprovalServer_() — Web App server handler
+ ************************************************/
+
+/**
+ * ENTRY POINT — called by Menu.gs
+ * User gate: pmo runs core directly, nazneen routes via Web App, others blocked.
+ */
+function revisionApproval() {
+  const user = Session.getActiveUser().getEmail().toLowerCase().trim();
+  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (user === OWNER_EMAIL_) {
+    const result = revisionApprovalCore_();
+    _showHeldAlert_(result);
+    return;
+  }
+
+  if (user === NAZNEEN_EMAIL_) {
+    _callWebApp_('revisionApproval', ss);
+    return;
+  }
+
+  ss.toast('You are not authorised to run Revision Approval.', 'Access Denied', 6);
+}
+
+/**
+ * Shows a ui.alert() dialog listing held employees + reasons, if any.
+ * Only called for the pmo-direct path (Web App path relays this text via
+ * revisionApprovalServer_'s returned message instead — see _callWebApp_).
+ */
+function _showHeldAlert_(result) {
+  if (!result || !result.held || !result.held.length) return;
+  const lines = result.held.map((h) => `⚠ ${h.reason}`).join('\n\n');
+  SpreadsheetApp.getUi().alert('Held for Verification — Action Required', lines, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function revisionApprovalCore_(bypassTabGuard, ssOverride, approverOverride) {
+  const ss = ssOverride || SpreadsheetApp.getActiveSpreadsheet();
+
+  const SRC_SHEET_NAME      = 'REVISION_APPROVAL';
+  const DST_SHEET_NAME      = 'REVISION_HISTORY';
+  const REJECTED_SHEET_NAME = 'REJECTED_HISTORY';
+
+  // Must run from REVISION_APPROVAL tab only (skipped when called from server handler)
+  if (!bypassTabGuard) {
+    const active = ss.getActiveSheet();
+    if (!active || active.getName() !== SRC_SHEET_NAME) {
+      ss.toast(
+        `Skipped: open "${SRC_SHEET_NAME}" tab and run again.`,
+        'Revision Approval',
+        6
+      );
+      return { approvedCount: 0, rejectedCount: 0, held: [] };
+    }
+  }
+
+  const src         = ss.getSheetByName(SRC_SHEET_NAME);
+  const dst         = ss.getSheetByName(DST_SHEET_NAME);
+  const rejectedDst = ss.getSheetByName(REJECTED_SHEET_NAME);
+  if (!src || !dst || !rejectedDst)
+    throw new Error('Missing required sheet(s). Check exact tab names.');
+
+  const srcLastRow = src.getLastRow();
+  const srcLastCol = src.getLastColumn();
+  if (srcLastRow < 2) return { approvedCount: 0, rejectedCount: 0, held: [] };
+
+  const dstLastCol      = dst.getLastColumn();
+  const rejectedLastCol = rejectedDst.getLastColumn();
+
+  const norm       = (h) => String(h || '').trim().replace(/\s+/g, ' ').toUpperCase();
+  const isApproved = (v) => String(v || '').trim().toUpperCase() === 'APPROVED';
+  const isRejected = (v) => String(v || '').trim().toUpperCase() === 'REJECTED';
+
+  const normId = (v) =>
+    String(v || '')
+      .trim()
+      .replace(/\s+/g, '')
+      .replace(/[‐-‒–—−]/g, '-')
+      .toUpperCase();
+
+  const srcHeaders      = src.getRange(1, 1, 1, srcLastCol).getDisplayValues()[0];
+  const dstHeaders      = dst.getRange(1, 1, 1, dstLastCol).getDisplayValues()[0];
+  const rejectedHeaders = rejectedDst.getRange(1, 1, 1, rejectedLastCol).getDisplayValues()[0];
+
+  const srcIdx      = new Map(srcHeaders.map((h, i)      => [norm(h), i]));
+  const dstIdx      = new Map(dstHeaders.map((h, i)      => [norm(h), i]));
+  const rejectedIdx = new Map(rejectedHeaders.map((h, i) => [norm(h), i]));
+
+  const KEY_ID               = norm('ID.NO');
+  const KEY_STATUS            = norm('APPROVAL_STATUS');
+  const KEY_REVISION_TYPE     = norm('REVISION_TYPE');
+  const KEY_OLD_SALARY_STATUS = norm('OLD_SALARY_STATUS');
+  const KEY_AADHAAR           = norm('AADHAAR NO');
+
+  if (!srcIdx.has(KEY_ID) || !srcIdx.has(KEY_STATUS))
+    throw new Error('REVISION_APPROVAL must contain ID.NO and APPROVAL_STATUS.');
+  if (!srcIdx.has(KEY_REVISION_TYPE))
+    throw new Error('REVISION_APPROVAL must contain REVISION_TYPE.');
+  if (!srcIdx.has(KEY_OLD_SALARY_STATUS))
+    throw new Error('REVISION_APPROVAL must contain OLD_SALARY_STATUS.');
+  if (!dstIdx.has(KEY_ID))
+    throw new Error('REVISION_HISTORY must contain ID.NO.');
+  if (!dstIdx.has(KEY_AADHAAR))
+    throw new Error('REVISION_HISTORY must contain AADHAAR NO.');
+  if (!rejectedIdx.has(KEY_ID) || !rejectedIdx.has(KEY_STATUS))
+    throw new Error('REJECTED_HISTORY must contain ID.NO and APPROVAL_STATUS.');
+
+  const ACTIVE_COL =
+    dstIdx.get(norm('ACTIVE_FOR_PAYROLL')) ?? dstIdx.get(norm('ACTIVE FOR PAYROLL'));
+  if (ACTIVE_COL === undefined)
+    throw new Error('REVISION_HISTORY must contain ACTIVE_FOR_PAYROLL.');
+
+  const APPROVED_BY_COL = dstIdx.get(norm('APPROVED_BY'));
+  const APPROVED_ON_COL = dstIdx.get(norm('APPROVED_ON'));
+  const REV_ID_COL      = dstIdx.get(norm('REV_ID'));
+
+  // ---------- Reissued-code detection: Aadhaar -> ACTIVE ID.NOs already in REVISION_HISTORY ----------
+  // NOTE: dst.getLastRow() is avoided here — AADHAAR NO is a whole-column MAP() spill formula,
+  // which stamps "" into every row down to the reference's end, inflating sheet-wide getLastRow().
+  // getLastNonEmptyInColumn_() scoped to ID.NO gives the true last row of real data instead.
+  const dstLastRow         = getLastNonEmptyInColumn_(dst, dstIdx.get(KEY_ID) + 1, 2);
+  const activeAadhaarToIds = new Map(); // AADHAAR NO -> Set<normalized ID.NO>
+  if (dstLastRow >= 2) {
+    const dstData = dst.getRange(2, 1, dstLastRow - 1, dstLastCol).getDisplayValues();
+    dstData.forEach((row) => {
+      const active  = String(row[ACTIVE_COL] || '').trim().toUpperCase();
+      const aadhaar = String(row[dstIdx.get(KEY_AADHAAR)] || '').trim();
+      const idNo    = normId(row[dstIdx.get(KEY_ID)]);
+      if (active !== 'ACTIVE' || !aadhaar || !idNo) return;
+      if (!activeAadhaarToIds.has(aadhaar)) activeAadhaarToIds.set(aadhaar, new Set());
+      activeAadhaarToIds.get(aadhaar).add(idNo);
+    });
+  }
+
+  const empIndex = _fetchEmployeeMasterIndex_();
+
+  const srcData = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
+
+  const approveIdxs = [];
+  const rejectIdxs  = [];
+  const held        = [];
+
+  srcData.forEach((r, i) => {
+    const idVal     = String(r[srcIdx.get(KEY_ID)] || '').trim();
+    const statusVal = r[srcIdx.get(KEY_STATUS)];
+    if (!idVal) return;
+
+    if (isApproved(statusVal)) {
+      const idNo         = normId(idVal);
+      const revisionType = String(r[srcIdx.get(KEY_REVISION_TYPE)] || '').trim().toUpperCase();
+      const empInfo      = empIndex.get(idNo);
+      const empName      = empInfo && empInfo.name ? empInfo.name : idNo;
+      const aadhaar       = empInfo ? empInfo.aadhaar : '';
+
+      let conflictId = '';
+      if (revisionType === 'SALARY FIXATION' && aadhaar) {
+        const activeIds = activeAadhaarToIds.get(aadhaar);
+        if (activeIds) {
+          for (const otherId of activeIds) {
+            if (otherId !== idNo) { conflictId = otherId; break; }
+          }
+        }
+      }
+
+      if (conflictId) {
+        const oldSalaryStatus = String(r[srcIdx.get(KEY_OLD_SALARY_STATUS)] || '').trim().toUpperCase();
+        if (oldSalaryStatus !== 'CHECKED') {
+          held.push({
+            idNo,
+            name: empName,
+            reason:
+              `Reissued Employee Code — Employee code ${idNo} (${empName}) is requesting Salary ` +
+              `Fixation, but this Aadhaar already has an ACTIVE salary record under code ${conflictId} ` +
+              `in REVISION_HISTORY. Please verify against the old signed salary letter, mark ` +
+              `OLD_SALARY_STATUS = CHECKED, and re-run approval.`,
+          });
+          return;
+        }
+      }
+
+      approveIdxs.push(i);
+    } else if (isRejected(statusVal)) {
+      rejectIdxs.push(i);
+    }
+  });
+
+  if (!approveIdxs.length && !rejectIdxs.length) {
+    const summary = held.length
+      ? `No APPROVED / REJECTED rows found. Held: ${held.length}`
+      : 'No APPROVED / REJECTED rows found.';
+    ss.toast(summary, 'Revision Approval', 6);
+    return { approvedCount: 0, rejectedCount: 0, held };
+  }
+
+  const excluded = new Set([
+    norm('ACTIVE_FOR_PAYROLL'),
+    norm('ACTIVE FOR PAYROLL'),
+    norm('APPROVED_BY'),
+    norm('APPROVED_ON'),
+    norm('REV_ID'),
+  ]);
+
+  const copyKeys = [];
+  dstIdx.forEach((_, k) => {
+    if (!excluded.has(k) && srcIdx.has(k)) copyKeys.push(k);
+  });
+
+  const dstChangeKey           = norm('CHANGE OF VALUE');
+  const srcChangeKeyCandidates = [
+    norm('CHANGE OF VALUE'),
+    norm('CHANGE_VALUE'),
+    norm('CHANGE'),
+  ];
+
+  const now      = new Date();
+  const approver = approverOverride || (() => {
+    try { return Session.getActiveUser().getEmail() || ''; }
+    catch { return ''; }
+  })();
+
+  const outRows     = [];
+  const insertedIds = [];
+
+  approveIdxs.forEach((i) => {
+    const sRow = srcData[i];
+    const dRow = new Array(dstLastCol).fill('');
+
+    copyKeys.forEach((k) => { dRow[dstIdx.get(k)] = sRow[srcIdx.get(k)]; });
+
+    if (dstIdx.has(dstChangeKey)) {
+      let picked = '';
+      for (const sk of srcChangeKeyCandidates) {
+        if (srcIdx.has(sk)) { picked = sRow[srcIdx.get(sk)]; break; }
+      }
+      if (picked !== '') dRow[dstIdx.get(dstChangeKey)] = picked;
+    }
+
+    if (dstIdx.has(KEY_STATUS))        dRow[dstIdx.get(KEY_STATUS)] = 'APPROVED';
+    if (APPROVED_BY_COL !== undefined)  dRow[APPROVED_BY_COL]        = approver;
+    if (APPROVED_ON_COL !== undefined)  dRow[APPROVED_ON_COL]        = now;
+    if (ACTIVE_COL !== undefined)       dRow[ACTIVE_COL]             = 'ACTIVE';
+
+    insertedIds.push(normId(sRow[srcIdx.get(KEY_ID)]));
+    outRows.push(dRow);
+  });
+
+  // ---------- Append APPROVED rows ----------
+  if (outRows.length) {
+    const idCol1Based = dstIdx.get(KEY_ID) + 1;
+    const startRow    = Math.max(
+      getLastNonEmptyInColumn_(dst, idCol1Based, 2) + 1,
+      2
+    );
+
+    const prevLastRow = startRow - 1;
+    let prevIds = [];
+    if (prevLastRow >= 2) {
+      prevIds = dst
+        .getRange(2, idCol1Based, prevLastRow - 1, 1)
+        .getDisplayValues()
+        .map((r) => normId(r[0]));
+    }
+
+    dst.insertRowsBefore(startRow, outRows.length);
+
+    for (let c = 0; c < dstLastCol; c++) {
+      if (c === REV_ID_COL) continue;
+      const colValues = outRows.map((row) => [row[c]]);
+      dst.getRange(startRow, c + 1, outRows.length, 1).setValues(colValues);
+    }
+
+    if (ACTIVE_COL !== undefined && prevIds.length) {
+      insertedIds.forEach((id) => {
+        for (let idx = prevIds.length - 1; idx >= 0; idx--) {
+          if (prevIds[idx] === id) {
+            dst.getRange(idx + 2, ACTIVE_COL + 1).setValue('IN-ACTIVE');
+            break;
+          }
+        }
+      });
+    }
+  }
+
+  // ---------- Append REJECTED rows ----------
+  if (rejectIdxs.length) {
+    const rejectedOutRows     = rejectIdxs.map((i) => srcData[i].slice(0, rejectedLastCol));
+    const rejectedIdCol1Based = rejectedIdx.get(KEY_ID) + 1;
+    const rejectedStartRow    = Math.max(
+      getLastNonEmptyInColumn_(rejectedDst, rejectedIdCol1Based, 2) + 1,
+      2
+    );
+
+    rejectedDst
+      .getRange(rejectedStartRow, 1, rejectedOutRows.length, rejectedLastCol)
+      .setValues(rejectedOutRows);
+  }
+
+  // ---------- Delete processed rows from source (bottom-up) ----------
+  [...approveIdxs, ...rejectIdxs]
+    .map((i) => i + 2)
+    .sort((a, b) => b - a)
+    .forEach((r) => src.deleteRow(r));
+
+  const finalSummary = held.length
+    ? `Approved ${outRows.length} revision(s). Rejected ${rejectIdxs.length} revision(s). Held: ${held.length}`
+    : `Approved ${outRows.length} revision(s). Rejected ${rejectIdxs.length} revision(s).`;
+
+  ss.toast(finalSummary, 'Revision Approval', 7);
+
+  return { approvedCount: outRows.length, rejectedCount: rejectIdxs.length, held };
+}
+
+/**
+ * Returns the last row index (>= startRow) where column col1Based has a non-empty display value.
+ */
+function getLastNonEmptyInColumn_(sheet, col1Based, startRow) {
+  const maxRows = sheet.getMaxRows();
+  const batch   = 2000;
+
+  for (let end = maxRows; end >= startRow; end -= batch) {
+    const begin  = Math.max(startRow, end - batch + 1);
+    const values = sheet
+      .getRange(begin, col1Based, end - begin + 1, 1)
+      .getDisplayValues();
+
+    for (let i = values.length - 1; i >= 0; i--) {
+      if (String(values[i][0] || '').trim() !== '') {
+        return begin + i;
+      }
+    }
+  }
+  return startRow - 1;
+}
+
+// ─── Web App Server Handler ────────────────────────────────────────────────────
+/**
+ * Called by doPost in WebApp Router.gs when action = "revisionApproval".
+ * Opens the spreadsheet by ID (runs as owner/pmo) and calls revisionApprovalCore_().
+ */
+function revisionApprovalServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  if (!spreadsheetId) {
+    return { success: false, message: 'Missing spreadsheetId in payload.' };
+  }
+
+  try {
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+
+    const revSheet = ss.getSheetByName('REVISION_APPROVAL');
+    if (!revSheet) {
+      return { success: false, message: 'Sheet REVISION_APPROVAL not found in spreadsheet.' };
+    }
+
+    const result = revisionApprovalCore_(true, ss, String(payload.requestedBy || '').trim()); // bypassTabGuard + ss + approver
+
+    let message = `Approved: ${result.approvedCount} | Rejected: ${result.rejectedCount}`;
+    if (result.held && result.held.length) {
+      message +=
+        ` | Held: ${result.held.length}\n\n` +
+        result.held.map((h) => `⚠ ${h.reason}`).join('\n\n');
+    }
+
+    return { success: true, message };
+
+  } catch (err) {
+    return {
+      success: false,
+      message: `revisionApproval error: ${err && err.message ? err.message : err}`,
+    };
+  }
+}

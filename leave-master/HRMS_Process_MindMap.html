@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HR Payroll System — Process Mind Map</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8f8f6;overflow:hidden;height:100vh;width:100vw}
+#topbar{position:fixed;top:0;left:0;right:0;height:52px;background:#fff;border-bottom:1px solid #e5e5e0;display:flex;align-items:center;padding:0 20px;gap:14px;z-index:100}
+#topbar h1{font-size:15px;font-weight:500;color:#1a1a1a;white-space:nowrap}
+.legend{display:flex;gap:10px;margin-left:12px;flex-wrap:wrap}
+.li{display:flex;align-items:center;gap:5px;font-size:11px;color:#666}
+.ld{width:8px;height:8px;border-radius:50%}
+#side-panel{position:fixed;top:52px;right:0;bottom:0;width:400px;background:#fff;border-left:1px solid #e5e5e0;z-index:90;display:flex;flex-direction:column}
+#panel-header{padding:14px 18px 10px;border-bottom:1px solid #f0f0ec}
+#panel-header p{font-size:12px;font-weight:600;color:#888;letter-spacing:0.05em;text-transform:uppercase}
+#panel-body{padding:16px 18px;flex:1;overflow-y:auto}
+#panel-title{font-size:16px;font-weight:600;margin-bottom:10px;line-height:1.4;display:none}
+#panel-detail{font-size:14px;color:#1a1a1a;line-height:1.8;display:none}
+#panel-detail ul{margin:6px 0 0 0;padding-left:18px}
+#panel-detail li{margin-bottom:4px}
+#panel-detail .freq{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;margin-bottom:10px;letter-spacing:0.03em}
+#panel-default{font-size:14px;color:#888;line-height:1.8;padding-top:4px}
+#canvas-wrap{position:fixed;top:52px;left:0;right:400px;bottom:0;overflow:hidden;cursor:grab}
+#canvas-wrap.dragging{cursor:grabbing}
+svg#map{position:absolute;top:0;left:0}
+#controls{position:fixed;bottom:24px;right:416px;display:flex;flex-direction:column;gap:6px;z-index:100}
+.ctrl-btn{width:34px;height:34px;border-radius:50%;background:#fff;border:1px solid #ddd;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;color:#444;user-select:none}
+.ctrl-btn:hover{background:#f0f0ec}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <img src="data:image/png;base64,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" style="height:38px;width:auto;object-fit:contain;flex-shrink:0" alt="Butler Leather logo">
+  <h1>HR Payroll System &mdash; Process Mind Map</h1>
+  <div class="legend">
+    <div class="li"><div class="ld" style="background:#1D9E75"></div>Attendance</div>
+    <div class="li"><div class="ld" style="background:#378ADD"></div>Payroll</div>
+    <div class="li"><div class="ld" style="background:#BA7517"></div>Salary advance</div>
+    <div class="li"><div class="ld" style="background:#993356"></div>Salary revision</div>
+    <div class="li"><div class="ld" style="background:#7F77DD"></div>Employee master</div>
+    <div class="li"><div class="ld" style="background:#888780"></div>Control / setup</div>
+    <div class="li"><div class="ld" style="background:#E24B4A"></div>Critical check</div>
+  </div>
+</div>
+
+<div id="side-panel">
+  <div id="panel-header"><p>Node detail</p></div>
+  <div id="panel-body">
+    <div id="panel-default">Hover over any node to see detailed information about that step.</div>
+    <div id="panel-title"></div>
+    <div id="panel-detail"></div>
+  </div>
+</div>
+
+<div id="canvas-wrap"><svg id="map"></svg></div>
+
+<div id="controls">
+  <div class="ctrl-btn" onclick="zoom(1.2)">+</div>
+  <div class="ctrl-btn" onclick="zoom(0.8)">−</div>
+  <div class="ctrl-btn" onclick="resetView()" style="font-size:12px">&#x27F3;</div>
+</div>
+
+<script>
+const C={
+  att: {fill:'#E8F8F2',stroke:'#1D9E75',text:'#085041'},
+  pay: {fill:'#EAF3FC',stroke:'#378ADD',text:'#0C447C'},
+  adv: {fill:'#FEF3E2',stroke:'#BA7517',text:'#633806'},
+  rev: {fill:'#FDEEF5',stroke:'#993356',text:'#4B1528'},
+  emp: {fill:'#EFEEFD',stroke:'#7F77DD',text:'#3C3489'},
+  ctl: {fill:'#F2F1EC',stroke:'#888780',text:'#444441'},
+  crit:{fill:'#FDEDED',stroke:'#E24B4A',text:'#501313'},
+  root:{fill:'#2C2C2A',stroke:'#2C2C2A',text:'#F8F8F6'},
+};
+
+function d(freq, bullets) {
+  return {freq, bullets};
+}
+
+const HR_TREE={id:'hr-root',label:'HR actions',type:'root',seq:null,
+  detail:d('Monthly cycle','All HR responsibilities in the monthly HRMS cycle. Follow phases in sequence ① through ⑮.'.split('.')),
+  children:[
+  {id:'hr1',label:'Employee master\nmaintenance',type:'emp',seq:'①',
+    detail:d('As needed',['Perform when an employee joins, changes role, or exits.','Not part of the monthly cycle — can happen any time.']),
+    children:[
+      {id:'hr1a',label:'Add new employee',type:'emp',seq:null,detail:d('As needed',['Fill all required columns: Name, Gender, Category, Department, Designation, D.O.J.','Enter bank details, PF/ESI applicability.','System auto-fills ID.NO (BUT-XXXX), STATUS, SKILL GROUP, AGE, SALARY ADVANCE STATUS via formula.'])},
+      {id:'hr1b',label:'Update details',type:'emp',seq:null,detail:d('As needed',['Update any changed field directly in Employee Master.','Formula columns (STATUS, SKILL GROUP, AGE, SALARY ADVANCE STATUS) auto-refresh immediately.'])},
+      {id:'hr1c',label:'Mark inactive',type:'emp',seq:null,detail:d('As needed',['Mark STATUS = INACTIVE only if employee has zero payroll working days in the current month.','Verify SALARY ADVANCE STATUS is clear (no active EMI balance) before changing status.'])},
+    ]},
+  {id:'hr2',label:'Salary advance master\n(as and when)',type:'adv',seq:'②',
+    detail:d('As and when — on advance payment',['Raise salary advance as and when needed during the month.','Intimate Nazneen mam to schedule EMI immediately after filling the ledger.']),
+    children:[
+      {id:'hr2a',label:'Fill advance ledger',type:'adv',seq:null,detail:d('As and when',['Enter: Advance Amount, Advance Paid Month, EMI Start Month, Tenure (months).','Set STATUS = ACTIVE.','Leave EMI Reference Number and EMI Scheduled Status blank — system fills on Schedule EMI run.'])},
+      {id:'hr2b',label:'Intimate Nazneen mam\nto schedule EMI',type:'adv',seq:null,detail:d('As and when',['After filling advance ledger, immediately inform Nazneen mam.','She opens Salary Advance Master → Advance menu → Schedule EMI.','All-or-nothing: one invalid row stops the entire run.'])},
+    ]},
+  {id:'hr3',label:'Salary revision\n(if applicable)',type:'rev',seq:'③',
+    detail:d('As needed / end of month check',['Submit revision any time during the month when needed.','Also check again at Phase ⑪ (end of month) before payroll lock.']),
+    children:[
+      {id:'hr3a',label:'Fill HR_UPDATE sheet',type:'rev',seq:null,detail:d('As needed',['Enter revised salary components: Basic, DA, HRA, Conveyance, Special Allowance, Increment.','Fill in the HR_UPDATE sheet of the Salary Revision spreadsheet.'])},
+      {id:'hr3b',label:'Submit for approval',type:'rev',seq:null,detail:d('As needed',['Click Submit button — system sends approval mail to approver.','Physical salary revision document must be signed by Zafar sir before system approval.','This is not a digital-only process.'])},
+      {id:'hr3c',label:'Fill petrol conveyance',type:'rev',seq:null,detail:d('As needed',['Enter conveyance amount in PETROL_CONVEYANCE_HISTORY sheet.','Same approval flow: physical sign from Zafar sir → approver sets APPROVAL_STATUS = APPROVED.'])},
+    ]},
+  {id:'hr4',label:'Generate attendance\nfile',type:'ctl',seq:'④',
+    detail:d('Monthly — once at start of month',['Generate the monthly attendance file from Attendance Control Center.','Always open the file via the control center link — never search in Google Drive.']),
+    children:[
+      {id:'hr4a',label:'Open Attendance\nControl Center',type:'ctl',seq:null,detail:d('Monthly',['Open the Attendance Control Center spreadsheet.','This is the master register of all monthly attendance files.'])},
+      {id:'hr4b',label:'Generate monthly\nattendance file',type:'ctl',seq:null,detail:d('Monthly',['Enter MONTH (from dropdown) and YEAR (4 digits) in the next blank row.','Click Attendance Control menu → Generate Attendance File.','System creates the file, names it Attendance_Month_Year, records FILE_ID.','Sequential order enforced — cannot skip months.'])},
+      {id:'hr4c',label:'Click month link\nto open file',type:'ctl',seq:null,detail:d('Monthly',['Click the FILE_ID hyperlink in the control center row.','Always use this link — do not open the attendance file from Drive search or a bookmark.'])},
+    ]},
+  {id:'hr5',label:'Monthly attendance\ninputs',type:'att',seq:'⑤',
+    detail:d('Monthly',['Main monthly attendance data entry phase.','Begin with Refresh Month, then fill all attendance tabs in order.']),
+    children:[
+      {id:'hr5a',label:'Refresh month',type:'att',seq:null,detail:d('Monthly — once',['Run Refresh Month before any data entry.','Clears: Employee Code, Carry Forwarded columns, Other Payments inputs, Other Deductions inputs, SA Run Timestamp, approved leave columns.','Preserves: formula columns, roster data (Name, Dept, Designation).'])},
+      {id:'hr5b',label:'Fill attendance entry',type:'att',seq:null,detail:d('Daily',['Fill daily attendance marks for each employee.','TOTAL WORKING DAYS: must be > 0.','TOTAL PRESENT DAYS: can be 0.','LOP DAYS: must be ≥ 0.','FINAL PAYABLE DAYS: must be ≥ 0 and ≤ TOTAL WORKING DAYS.'])},
+      {id:'hr5c',label:'Fill late entry',type:'att',seq:null,detail:d('Daily',['Navigate to Late Entry tab.','Allowed values per day: blank (on time), numeric minutes (e.g. 45), P60 (permitted 60 min), P120 (permitted 120 min — STAFF only).','WO is auto-filled for Sundays.','Custom formula validation enforces allowed values.'])},
+      {id:'hr5d',label:'Fill OT entry',type:'att',seq:null,detail:d('As needed',['Navigate to OT Entry tab.','Enter one row per OT instance: DATE (MM/DD/YY), EMPLOYEE CODE, OT START, OT END, OT PURPOSE.','Cleared by Refresh Month.'])},
+    ]},
+  {id:'hr6',label:'Mid-month if needed:\nsync / remove',type:'att',seq:'⑥',
+    detail:d('As needed — must be BEFORE Get Leave Balances',['Sync New Employees and Remove Inactive Employee must be done before Get Leave Balances.','Both are permanently blocked after the file is locked.']),
+    children:[
+      {id:'hr6a',label:'Sync new employee',type:'att',seq:null,detail:d('As needed',['Run if a new employee joins mid-month.','Prerequisite: Refresh Month must have been run first.','Blocked after file lock — error: "This attendance file is LOCKED. Sync New Employees is not allowed."'])},
+      {id:'hr6b',label:'Remove employee',type:'att',seq:null,detail:d('As needed',['First mark STATUS = INACTIVE in Employee Master.','Then run Remove Inactive Employee from the menu.','Blocked after file lock — error: "This attendance file is LOCKED. Removing an employee is not allowed."'])},
+    ]},
+  {id:'hr7',label:'End of month:\nfinal attendance inputs',type:'att',seq:'⑦',
+    detail:d('Monthly — end of month',['Complete all remaining attendance inputs before calculating late penalty and locking the file.']),
+    children:[
+      {id:'hr7a',label:'Fill carry forwarded',type:'att',seq:null,detail:d('Monthly — end of month',['Navigate to Carry Forwarded tab.','Enter: Employee Code, Carry Forwarded Days, CF From Month [MM/DD/YY], CF Type, Remarks.','Each entry must have supporting evidence.'])},
+      {id:'hr7b',label:'Fill other payments',type:'att',seq:null,detail:d('As needed',['Navigate to Other Payments tab.','Enter: EMPLOYEE CODE, PAYMENT TYPE, AMOUNT, MONTH APPLICABLE [MM/DD/YY], REMARKS, APPROVED BY.'])},
+      {id:'hr7c',label:'Fill other deductions',type:'att',seq:null,detail:d('As needed',['Navigate to Other Deductions tab.','Enter: EMPLOYEE CODE, AMOUNT, REMARKS.'])},
+    ]},
+  {id:'hr8',label:'Calculate late\npenalty',type:'att',seq:'⑧',
+    detail:d('Monthly — once',['Must be run from the Late Entry sheet tab only.','Run before Get Leave Balances.','Result (LATE PENALTY COUNT) is protected after calculation.']),
+    children:[
+      {id:'hr8a',label:'Navigate to\nLate Entry tab',type:'att',seq:null,detail:d('Monthly',['Click the "Late Entry" sheet tab at the bottom of the attendance file.','Do not run from any other tab — error: "Please run this function from the Late Entry sheet only."'])},
+      {id:'hr8b',label:'Run Calculate\nLate Penalty',type:'att',seq:null,detail:d('Monthly — once',['Click Leave menu → Calculate late penalty.','Worker: 1 permitted slot (P60) per month.','Staff: 2 permitted slots (P120 once or P60 twice).','Writes LATE PENALTY COUNT per employee.','Column is protected after calculation.'])},
+    ]},
+  {id:'hr9',label:'Get Leave Balances\n— LOCKS the file',type:'crit',seq:'⑨',
+    detail:d('Monthly — once, irreversible',['CRITICAL ONE-TIME ACTION — permanently locks the attendance file.','Cannot be undone.','All data entry, sync, remove, and late penalty must be complete before running this.']),
+    children:[
+      {id:'hr9a',label:'Verify all data\nis complete',type:'crit',seq:null,detail:d('Monthly',['Confirm before running: all attendance marks entered and reviewed.','Late entry data filled.','OT, Other Payments, Other Deductions, Carry Forwarded complete.','Sync New Employees and Remove Inactive done if required.','Late Penalty calculated.'])},
+      {id:'hr9b',label:'Run Get\nLeave Balances',type:'crit',seq:null,detail:d('Monthly — once',['Click Leave menu → Get Leave Balances.','Confirmation dialog: "Shall I lock the file and fetch leave balances? (This action is ONE TIME only.)" — click YES.','System fetches leave balances from Leave Master → writes to Leave Balances sheet.','Fills and protects LOCKED STATUS column.','Protects Leave Balances sheet.'])},
+      {id:'hr9c',label:'File is now locked',type:'crit',seq:null,detail:d('Monthly',['LOCKED STATUS column filled with timestamp and protected.','Refresh Month is blocked.','Sync New Employees is blocked.','Remove Inactive Employee is blocked.','Get Leave Balances cannot be run again.','Salary Advance Get EMI is now ENABLED.'])},
+      {id:'hr9d',label:'Fill approved\nleave columns',type:'att',seq:null,detail:d('Monthly — after lock',['Now fill approved leave columns in Attendance entry tab.','APPROVED EL DAYS: enter approved earned leave days per employee.','APPROVED SL DAYS: enter approved sick leave days per employee.','APPROVED CL DAYS: enter approved casual leave days per employee.','MANAGEMENT APPROVAL FOR LONG LEAVES: set APPROVED or leave blank.'])},
+    ]},
+  {id:'hr10',label:'Salary advance\ndeductions',type:'adv',seq:'⑩',
+    detail:d('Monthly — once',['Salary Advance Get EMI can ONLY run after file is locked (Get Leave Balances completed).','Blocked if attendance not locked.']),
+    children:[
+      {id:'hr10a',label:'Check: new EMI\nto schedule?',type:'adv',seq:null,detail:d('Monthly',['Before running Get EMI — confirm with Nazneen mam if any new advance EMI needs scheduling first.','Do not run Get EMI if a new advance is pending schedule in the master.'])},
+      {id:'hr10b',label:'Navigate to Salary\nAdvance deductions tab',type:'adv',seq:null,detail:d('Monthly',['Click "Salary Advance deductions" tab at the bottom of the attendance file.','Both Get EMI and Refresh EMI buttons must be run from this tab only.','Error if wrong tab: "Please run this button from Salary Advance deductions sheet only."'])},
+      {id:'hr10c',label:'Run Get EMI',type:'adv',seq:null,detail:d('Monthly — once',['Click Salary Advance → Get Salary Advance EMI.','Requires attendance LOCKED.','Loads snapshot from Master Shared EMI Summary for this month.','Writes: Month, Employee Code, Name, Department, EMI Reference Number, EMI Amount, Current Balance.','Also writes SA Run Timestamp.'])},
+      {id:'hr10d',label:'Fill HR decision',type:'adv',seq:null,detail:d('Monthly',['For each EMI row, fill HR Decision column.','Leave blank: normal deduction proceeds.','SKIP: skip this month EMI.','RESIGNED: employee resigned — write off future EMIs.','ABSCOND: absconded — write off future EMIs.'])},
+    ]},
+  {id:'hr11',label:'End of month:\nrevision check',type:'rev',seq:'⑪',
+    detail:d('Monthly — end of month',['Final check before generating payroll workings.','Confirm no pending salary revision, fixation, or petrol conveyance approval.']),
+    children:[
+      {id:'hr11a',label:'Any salary revision /\nfixation pending?',type:'rev',seq:null,detail:d('Monthly',['Review if any employee salary revision or fixation needs to be submitted before payroll lock.','Check both HR_UPDATE sheet and PETROL_CONVEYANCE_HISTORY.'])},
+      {id:'hr11b',label:'Submit if needed',type:'rev',seq:null,detail:d('As needed',['Fill HR_UPDATE → click Submit → prepare physical document for Zafar sir sign.','Nazneen mam approves in system after physical sign.','Complete fully before proceeding to payroll workings generation.'])},
+    ]},
+  {id:'hr12',label:'Generate payroll\nworkings file',type:'ctl',seq:'⑫',
+    detail:d('Monthly — once',['HR generates the monthly payroll workings file from Payroll Control Center.','Always open via the control center link — never from a direct bookmark.']),
+    children:[
+      {id:'hr12a',label:'Open Payroll\nControl Center',type:'ctl',seq:null,detail:d('Monthly',['Open the Payroll Control Center spreadsheet.','This is the master register of all monthly payroll workings files.'])},
+      {id:'hr12b',label:'Generate payroll\nworkings',type:'ctl',seq:null,detail:d('Monthly — once',['Enter MONTH and YEAR in the next blank row.','Click Payroll Control menu → Generate Payroll Workings.','System creates the file and records FILE_ID and metadata.'])},
+      {id:'hr12c',label:'Click month link\nto open file',type:'ctl',seq:null,detail:d('Monthly',['Click the payroll workings file hyperlink for the current month.','Always open from this link — do not bookmark the payroll file directly.'])},
+    ]},
+  {id:'hr13',label:'Payroll data\nprocessing',type:'pay',seq:'⑬',
+    detail:d('Monthly',['HR runs Validate Attendance and Get Payroll Data in the payroll workings file.','First-time Google authorization required.']),
+    children:[
+      {id:'hr13a',label:'Run Validate\nAttendance',type:'pay',seq:null,detail:d('Monthly',['Click Payroll menu → Validate Attendance.','First-time only: Google "Authorization required" popup → click OK → scroll down → click Continue.','Script takes 15–30 seconds.','On success: writes PAYROLL_MONTH_LABEL and ATTENDANCE_FILE_ID to META_DATA.','Resolve any errors shown before proceeding.'])},
+      {id:'hr13b',label:'Run Get\nPayroll Data',type:'pay',seq:null,detail:d('Monthly',['Click Payroll menu → Get Payroll Data.','First-time authorization popup may appear — OK → Continue.','Script takes 15–30 seconds.','Pulls data from attendance file, Employee Master, Salary Revision History.','Populates all columns in PAY_ROLL tab.','Wait for success popup before proceeding.'])},
+    ]},
+  {id:'hr14',label:'Critical: negative\nbalance check',type:'crit',seq:'⑭',
+    detail:d('Monthly',['HR must check for negative balance employees after Get Payroll Data.','Resolve fully before handing off to Admin.']),
+    children:[
+      {id:'hr14a',label:'Check META_DATA:\nnegative balance',type:'crit',seq:null,detail:d('Monthly',['Open META_DATA tab in payroll workings file.','Find row: "Employees with Negative Balance After Advance Deduction".','Payroll Status value must be blank/null to proceed.','If non-blank (shows a count) — resolve before handing to Admin.'])},
+      {id:'hr14b',label:'If values: filter\nNET column',type:'crit',seq:null,detail:d('Monthly — if issue found',['Go to PAY_ROLL tab.','Filter NET column for negative values.','Identify all affected employees.','These employees have EMI deduction exceeding their net salary this month.'])},
+      {id:'hr14c',label:'Fix HR decision\nin attendance file',type:'crit',seq:null,detail:d('Monthly — if issue found',['Go to attendance file → Salary Advance deductions tab.','For each affected employee, set correct HR Decision.','SKIP: skip this month EMI deduction.','Other write-off options as appropriate.','Save the change.'])},
+      {id:'hr14d',label:'Re-run Validate\nAttendance',type:'crit',seq:null,detail:d('Monthly — if issue found',['After fixing HR Decision, re-run Validate Attendance in the payroll workings file.','This is mandatory — Admin cannot proceed until this re-validation is complete.','Inform Admin once re-validation is done.'])},
+    ]},
+  {id:'hr15',label:'Payroll release\nconfirmation',type:'pay',seq:'⑮',
+    detail:d('Monthly',['HR sets Payroll Release Confirmation for any employee whose salary needs to be held this month.']),
+    children:[
+      {id:'hr15a',label:'Any salary to hold?',type:'pay',seq:null,detail:d('Monthly',['Review if any employee salary should not be released this month.','Reasons: disciplinary action, dispute, or any other reason.','Must be decided before Admin runs Generate Locked Payroll.'])},
+      {id:'hr15b',label:'Set Payroll Release\nConfirmation = HOLD',type:'pay',seq:null,detail:d('Monthly — if needed',['In PAY_ROLL tab, find the employee row.','Set "Payroll Release Confirmation" column = HOLD.','Bank transfer will be skipped for this employee.'])},
+    ]},
+]};
+
+const ADM_TREE={id:'adm-root',label:'Admin actions',type:'root',seq:null,
+  detail:d('Monthly cycle','All Admin responsibilities in the monthly HRMS cycle. Follow phases in sequence ① through ⑦.'.split('.')),
+  children:[
+  {id:'adm1',label:'Schedule EMI\n(as and when)',type:'adv',seq:'①',
+    detail:d('As and when — on bank payment',['Run Schedule EMI in Salary Advance Master as soon as advance is paid from the bank.','Do not wait until month end.']),
+    children:[
+      {id:'adm1a',label:'Open Salary Advance\nMaster',type:'adv',seq:null,detail:d('As and when',['Open the Salary Advance Master spreadsheet.'])},
+      {id:'adm1b',label:'Run Schedule EMI\nfrom menu',type:'adv',seq:null,detail:d('As and when',['Click Advance menu → Schedule EMI (create schedule for new advances).','All-or-nothing: one invalid row stops entire run.','On success: EMI Reference Numbers assigned, EMI_SCHEDULE rows created.','Check the result alert carefully.'])},
+    ]},
+  {id:'adm2',label:'Salary revision\napproval',type:'rev',seq:'②',
+    detail:d('As and when — on mail receipt',['On receiving revision mail from HR.','Physical approval from Zafar sir is mandatory before system approval.']),
+    children:[
+      {id:'adm2a',label:'Get physical sign\nfrom Zafar sir',type:'rev',seq:null,detail:d('As and when',['Physical salary revision document must be reviewed and signed by Zafar sir.','Mandatory — do not approve in system without physical signature.','This is not a digital-only process.'])},
+      {id:'adm2b',label:'Approve in system',type:'rev',seq:null,detail:d('As and when',['After physical sign, open Salary Revision spreadsheet.','Set APPROVAL_STATUS = APPROVED for the employee.','This gates payroll inclusion of the revised salary components.'])},
+      {id:'adm2c',label:'Petrol conveyance\napproval',type:'rev',seq:null,detail:d('As and when',['Same flow as salary revision.','Physical sign from Zafar sir required first.','Then set APPROVAL_STATUS = APPROVED in PETROL_CONVEYANCE_HISTORY sheet.'])},
+      {id:'adm2d',label:'Notify HR to re-run\nGet Payroll Data',type:'rev',seq:null,detail:d('As and when — after approval',['If any revision or petrol conveyance is approved, inform HR immediately.','HR must re-run Get Payroll Data in the payroll workings file.','Admin must wait for HR confirmation before proceeding to Validate Payroll.'])},
+    ]},
+  {id:'adm3',label:'Verify attendance\nfile tabs',type:'att',seq:'③',
+    detail:d('Monthly — before payroll',['Open attendance file via Attendance Control Center link.','Verify all tabs thoroughly before proceeding to payroll.','This is Admin quality gate.']),
+    children:[
+      {id:'adm3a',label:'Attendance entry:\nlong leave approval',type:'att',seq:null,detail:d('Monthly',['Filter MANAGEMENT APPROVAL FOR LONG LEAVES column in Attendance entry tab.','Cross-check each APPROVED value against physical approval mail received.','No unverified long-leave approval should exist.'])},
+      {id:'adm3b',label:'OT entry:\nverify purpose',type:'att',seq:null,detail:d('Monthly',['Open OT Entry tab.','Check each OT record has a valid and justified OT purpose.','Verify OT hours are reasonable against source records.'])},
+      {id:'adm3c',label:'Carry forwarded:\nverify evidence',type:'att',seq:null,detail:d('Monthly',['Open Carry Forwarded tab.','Each carry forwarded days entry must be backed by a supporting evidence document.','Do not allow unsupported carry forward entries.'])},
+      {id:'adm3d',label:'Other payments &\ndeductions: verify',type:'att',seq:null,detail:d('Monthly',['Open Other Payments and Other Deductions tabs.','Verify each entry against supporting documents.','Check amounts, employee codes, month applicable, and approval fields.'])},
+      {id:'adm3e',label:'Salary advance:\nHR decision filled?',type:'adv',seq:null,detail:d('Monthly',['Open Salary Advance deductions tab.','Ensure HR Decision column is filled correctly for ALL EMI rows.','Verify SA Run Timestamp is populated — confirms Get EMI was run.'])},
+    ]},
+  {id:'adm4',label:'Validate payroll',type:'pay',seq:'④',
+    detail:d('Monthly',['Admin runs Validate Payroll after HR completes data processing.','First-time Google authorization required.']),
+    children:[
+      {id:'adm4a',label:'Confirm META_DATA:\nattendance validated',type:'pay',seq:null,detail:d('Monthly',['Open payroll workings file → META_DATA tab.','Confirm ATTENDANCE_VALIDATION row shows validated status.','Confirms HR has completed Validate Attendance and Get Payroll Data successfully.'])},
+      {id:'adm4b',label:'Run Validate\nPayroll',type:'pay',seq:null,detail:d('Monthly',['Click Payroll menu → Validate Payroll.','First-time only: Google authorization popup → OK → Continue.','Runs 11 pre-lock checks including zero gross employees warning.','Resolve all errors before proceeding.'])},
+    ]},
+  {id:'adm5',label:'Critical: negative\nbalance check',type:'crit',seq:'⑤',
+    detail:d('Monthly — before lock',['CRITICAL. Admin checks for negative balance employees and sets PROCEED after HR fixes.']),
+    children:[
+      {id:'adm5a',label:'Check META_DATA:\nnegative balance',type:'crit',seq:null,detail:d('Monthly',['Open META_DATA tab.','Find row: "Employees with Negative Balance After Advance Deduction".','Must be blank/null to proceed.','If non-blank — do not proceed to lock.'])},
+      {id:'adm5b',label:'If values: filter\nNET column',type:'crit',seq:null,detail:d('Monthly — if issue found',['Go to PAY_ROLL tab.','Filter NET column for negative values.','Identify all affected employees.'])},
+      {id:'adm5c',label:'Ask HR to fix\nHR decision',type:'crit',seq:null,detail:d('Monthly — if issue found',['Communicate to HR: employee name and required HR Decision fix.','HR updates Salary Advance deductions tab in attendance file.','HR must re-run Validate Attendance after fixing.','Wait for HR confirmation before proceeding.'])},
+      {id:'adm5d',label:'Re-run Validate\nAttendance',type:'crit',seq:null,detail:d('Monthly — if issue found',['After HR fixes HR Decision and re-validates attendance, confirm with HR.','Do not proceed to Generate Locked Payroll until HR confirms re-validation is complete.'])},
+      {id:'adm5e',label:'Set PROCEED in\nMETA_DATA',type:'crit',seq:null,detail:d('Monthly — if issue found',['In META_DATA tab, set Salary Master Status = PROCEED for the affected employee row.','Re-check "Employees with Negative Balance After Advance Deduction".','Repeat the full loop until value is blank/null.'])},
+    ]},
+  {id:'adm6',label:'Generate locked\npayroll',type:'pay',seq:'⑥',
+    detail:d('Monthly — once',['Admin locks the payroll.','Both attendance and payroll workings files get fully protected after this step.']),
+    children:[
+      {id:'adm6a',label:'Run Generate\nLocked Payroll',type:'pay',seq:null,detail:d('Monthly — once',['Click Payroll menu → Generate Locked Payroll.','Runs all pre-lock assertions (9+ checks).','On success: creates locked payroll file, writes LOCKED to Salary Advance deductions, pushes Recovered Amount Ledger snapshot, pushes Leave Ledger snapshot.','Protects entire attendance file and payroll workings file.'])},
+      {id:'adm6b',label:'Confirm LOCK_STATUS\nin META_DATA',type:'pay',seq:null,detail:d('Monthly',['Open META_DATA tab after lock.','Verify LOCK_STATUS = LOCKED.','Confirm LOCKED_FILE_ID (hyperlink) and LOCKED_ON (timestamp) are populated.','If any are blank — lock did not complete successfully.'])},
+      {id:'adm6c',label:'Check hold\nemployees',type:'crit',seq:null,detail:d('Monthly',['Review if any employee salary needs to be held this month.','Check "Payroll Release Confirmation" column in PAY_ROLL tab.','If HR has set HOLD — confirmed.','If HR missed it — Admin sets HOLD now.','Only Payroll Release Confirmation and Bank Transfer Mark Down columns remain editable after lock.'])},
+    ]},
+  {id:'adm7',label:'Generate bank\ntransfer file',type:'pay',seq:'⑦',
+    detail:d('Monthly — once',['Final step of the monthly payroll cycle.','Verify totals match before distribution.']),
+    children:[
+      {id:'adm7a',label:'Run Generate Bank\nTransfer File',type:'pay',seq:null,detail:d('Monthly — once',['Click Payroll menu → Generate Bank Transfer File.','Splits employees by bank (Union Bank vs Other Banks).','Skips NEGATIVE NET employees — labelled "SKIPPED - NEGATIVE".','Skips HOLD employees.','Records file ID and totals in META_DATA.'])},
+      {id:'adm7b',label:'Verify totals match',type:'pay',seq:null,detail:d('Monthly',['TOTAL_BANK_TRANSFERRED_AMOUNT in META_DATA must equal grand total in PAY_ROLL summary.','If totals do not match — do not distribute the file.','Investigate discrepancy first.'])},
+      {id:'adm7c',label:'Note skipped &\nhold employees',type:'pay',seq:null,detail:d('Monthly',['Record list of skipped employees (negative NET — bank transfer not generated).','Record list of hold employees (Payroll Release Confirmation = HOLD).','Communicate both lists to HR for follow-up action.'])},
+    ]},
+]};
+
+const FREQ_COLORS={
+  'Monthly':{bg:'#EAF3FC',color:'#0C447C'},
+  'Monthly — once':{bg:'#EAF3FC',color:'#0C447C'},
+  'Monthly — once, irreversible':{bg:'#FDEDED',color:'#501313'},
+  'Monthly — end of month':{bg:'#EAF3FC',color:'#0C447C'},
+  'Monthly — before payroll':{bg:'#EAF3FC',color:'#0C447C'},
+  'Monthly — before lock':{bg:'#FDEDED',color:'#501313'},
+  'Monthly — after lock':{bg:'#E8F8F2',color:'#085041'},
+  'Monthly — if issue found':{bg:'#FDEDED',color:'#501313'},
+  'Monthly cycle':{bg:'#EAF3FC',color:'#0C447C'},
+  'Daily':{bg:'#E8F8F2',color:'#085041'},
+  'As needed':{bg:'#F2F1EC',color:'#444441'},
+  'As and when — on bank payment':{bg:'#FEF3E2',color:'#633806'},
+  'As and when — on mail receipt':{bg:'#FDEEF5',color:'#4B1528'},
+  'As and when — after approval':{bg:'#FDEEF5',color:'#4B1528'},
+  'As and when':{bg:'#FEF3E2',color:'#633806'},
+  'As needed / end of month check':{bg:'#F2F1EC',color:'#444441'},
+};
+
+const svg=document.getElementById('map');
+const wrap=document.getElementById('canvas-wrap');
+let scale=1,tx=60,ty=70,dragging=false,lastX,lastY;
+const expanded=new Set();
+const positions={};
+const NODE_W=150,NODE_H=36,GAP_X=52,GAP_Y=11;
+
+function mkEl(tag){return document.createElementNS('http://www.w3.org/2000/svg',tag)}
+
+function nodeHeight(node){
+  if(!expanded.has(node.id)||!node.children||!node.children.length)return NODE_H;
+  let h=node.children.reduce((a,ch)=>a+nodeHeight(ch)+GAP_Y,0)-GAP_Y;
+  return Math.max(h,NODE_H);
+}
+
+function layoutTree(tree,startY){
+  const result=[];
+  function walk(node,x,y,parentId){
+    result.push({node,x,y,parentId});
+    positions[node.id]={x,y};
+    if(node.children&&expanded.has(node.id)){
+      const cx=x+NODE_W+GAP_X;let cy=y;
+      node.children.forEach(ch=>{walk(ch,cx,cy,node.id);cy+=nodeHeight(ch)+GAP_Y;});
+    }
+  }
+  walk(tree,0,startY,null);
+  return result;
+}
+
+function showPanel(node){
+  const col=C[node.type]||C.ctl;
+  document.getElementById('panel-default').style.display='none';
+  const pt=document.getElementById('panel-title');
+  const pd=document.getElementById('panel-detail');
+  pt.textContent=node.label.replace('\n',' ');
+  pt.style.color=col.stroke;
+  pt.style.display='block';
+  const det=node.detail;
+  if(!det){pd.style.display='none';return;}
+  const fc=FREQ_COLORS[det.freq]||{bg:'#F2F1EC',color:'#444441'};
+  let html=`<span class="freq" style="background:${fc.bg};color:${fc.color}">${det.freq}</span>`;
+  html+=`<ul>${det.bullets.map(b=>`<li>${b}</li>`).join('')}</ul>`;
+  pd.innerHTML=html;
+  pd.style.display='block';
+}
+
+function render(){
+  svg.innerHTML='';
+  const hrItems=layoutTree(HR_TREE,0);
+  const hrH=nodeHeight(HR_TREE);
+  const admStartY=hrH+90;
+  const admItems=layoutTree(ADM_TREE,admStartY);
+
+  const sep=mkEl('line');
+  sep.setAttribute('x1',0);sep.setAttribute('y1',admStartY-44);
+  sep.setAttribute('x2',1000);sep.setAttribute('y2',admStartY-44);
+  sep.setAttribute('stroke','#ddd');sep.setAttribute('stroke-width','1');
+  sep.setAttribute('stroke-dasharray','6 4');
+  svg.appendChild(sep);
+
+  [['HR ACTIONS — MONTHLY CYCLE (① – ⑮)',0-28,'#7F77DD'],
+   ['ADMIN ACTIONS — MONTHLY CYCLE (① – ⑦)',admStartY-28,'#378ADD']
+  ].forEach(([label,y,color])=>{
+    const t=mkEl('text');
+    t.setAttribute('x',0);t.setAttribute('y',y);
+    t.setAttribute('fill',color);t.setAttribute('font-size','11');
+    t.setAttribute('font-weight','600');t.setAttribute('letter-spacing','0.04em');
+    t.textContent=label;svg.appendChild(t);
+  });
+
+  [...hrItems,...admItems].forEach(({node,x,y,parentId})=>{
+    if(parentId===null)return;
+    const px=positions[parentId];if(!px)return;
+    const x1=px.x+NODE_W,y1=px.y+NODE_H/2,x2=x,y2=y+NODE_H/2,mx=(x1+x2)/2;
+    const p=mkEl('path');
+    p.setAttribute('d',`M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`);
+    p.setAttribute('fill','none');
+    p.setAttribute('stroke',C[node.type]?.stroke||'#aaa');
+    p.setAttribute('stroke-width','1.5');p.setAttribute('opacity','0.55');
+    svg.appendChild(p);
+  });
+
+  [...hrItems,...admItems].forEach(({node,x,y})=>drawNode(node,x,y));
+  const allItems=[...hrItems,...admItems];
+  svg.setAttribute('width',Math.max(...allItems.map(i=>i.x))+NODE_W+80);
+  svg.setAttribute('height',Math.max(...allItems.map(i=>i.y))+NODE_H+80);
+  applyTransform();
+}
+
+function drawNode(node,x,y){
+  const col=C[node.type]||C.ctl;
+  const g=mkEl('g');g.style.cursor='pointer';
+  const rect=mkEl('rect');
+  rect.setAttribute('x',x);rect.setAttribute('y',y);
+  rect.setAttribute('width',NODE_W);rect.setAttribute('height',NODE_H);
+  rect.setAttribute('rx','18');rect.setAttribute('fill',col.fill);
+  rect.setAttribute('stroke',col.stroke);rect.setAttribute('stroke-width','1.2');
+  g.appendChild(rect);
+  if(node.seq){
+    const bc=mkEl('circle');bc.setAttribute('cx',x+14);bc.setAttribute('cy',y+18);bc.setAttribute('r','9');bc.setAttribute('fill',col.stroke);g.appendChild(bc);
+    const bt=mkEl('text');bt.setAttribute('x',x+14);bt.setAttribute('y',y+18);bt.setAttribute('fill','#fff');bt.setAttribute('font-size','8');bt.setAttribute('text-anchor','middle');bt.setAttribute('dominant-baseline','middle');bt.textContent=node.seq;g.appendChild(bt);
+  }
+  const lines=node.label.split('\n');
+  const lx=node.seq?x+NODE_W/2+6:x+NODE_W/2;
+  lines.forEach((line,i)=>{
+    const t=mkEl('text');t.setAttribute('x',lx);t.setAttribute('y',y+NODE_H/2+(i-(lines.length-1)/2)*13);t.setAttribute('fill',col.text);t.setAttribute('font-size','11');t.setAttribute('text-anchor','middle');t.setAttribute('dominant-baseline','middle');t.textContent=line;g.appendChild(t);
+  });
+  if(node.children&&node.children.length){
+    const bx=x+NODE_W-12,by=y+NODE_H/2;
+    const bc=mkEl('circle');bc.setAttribute('cx',bx);bc.setAttribute('cy',by);bc.setAttribute('r','8');bc.setAttribute('fill',col.stroke);g.appendChild(bc);
+    const bt=mkEl('text');bt.setAttribute('x',bx);bt.setAttribute('y',by);bt.setAttribute('fill','#fff');bt.setAttribute('font-size','11');bt.setAttribute('text-anchor','middle');bt.setAttribute('dominant-baseline','middle');bt.textContent=expanded.has(node.id)?'‹':'›';g.appendChild(bt);
+  }
+  g.addEventListener('click',()=>{
+    if(!node.children||!node.children.length)return;
+    expanded.has(node.id)?expanded.delete(node.id):expanded.add(node.id);render();
+  });
+  g.addEventListener('mouseenter',()=>showPanel(node));
+  svg.appendChild(g);
+}
+
+function applyTransform(){svg.style.transform=`translate(${tx}px,${ty}px) scale(${scale})`;svg.style.transformOrigin='0 0';}
+function zoom(f){scale=Math.min(Math.max(scale*f,0.25),3);applyTransform();}
+function resetView(){scale=1;tx=60;ty=70;applyTransform();}
+
+wrap.addEventListener('mousedown',e=>{if(e.target.closest('g'))return;dragging=true;lastX=e.clientX;lastY=e.clientY;wrap.classList.add('dragging');});
+window.addEventListener('mousemove',e=>{if(!dragging)return;tx+=e.clientX-lastX;ty+=e.clientY-lastY;lastX=e.clientX;lastY=e.clientY;applyTransform();});
+window.addEventListener('mouseup',()=>{dragging=false;wrap.classList.remove('dragging');});
+wrap.addEventListener('wheel',e=>{e.preventDefault();zoom(e.deltaY<0?1.1:0.9);},{passive:false});
+let lTX,lTY;
+wrap.addEventListener('touchstart',e=>{lTX=e.touches[0].clientX;lTY=e.touches[0].clientY;});
+wrap.addEventListener('touchmove',e=>{e.preventDefault();tx+=e.touches[0].clientX-lTX;ty+=e.touches[0].clientY-lTY;lTX=e.touches[0].clientX;lTY=e.touches[0].clientY;applyTransform();},{passive:false});
+
+render();
+</script>
+</body>
+</html>

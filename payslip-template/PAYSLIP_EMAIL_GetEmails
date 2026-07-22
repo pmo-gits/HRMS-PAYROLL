@@ -1,0 +1,235 @@
+/*******************************************************
+ * PAYSLIP EMAIL — GET STAFF EMAILS
+ *
+ * Same standalone project as _WebApp.gs / _Menu.gs / _SendMails.gs
+ * (bound to the Template Payslip file — makeCopy() carries this into
+ * every monthly Payslip_<Month> file automatically, no redeploy needed).
+ *
+ * Purpose: before "Send Staff Payslip Emails" can run, this fills in
+ * BLANK "Email" cells on Staff Email Master by looking up each
+ * Employee Code in Employee Master's "PERSONAL EMAIL ID" column.
+ * Never overwrites an Email cell that already has a value — if HR
+ * typed one in directly, it's left alone.
+ *
+ * On completion (even if some employees are still missing an email),
+ * stamps a timestamp into _GENERATED_LOG!F1 in THIS Payslip file.
+ * That stamp is the "Get Staff Emails has been run" marker that
+ * sendStaffPayslipEmailsServer_ (in PAYSLIP_EMAIL_SendMails.gs)
+ * checks for before it will send anything.
+ *
+ * Reuses PES_TAB_NAME / PES_HEADERS / pesNorm_ / pesBuildHeaderIndex_ /
+ * pesRequireHeader_ from PAYSLIP_EMAIL_SendMails.gs — same project,
+ * same scope, no duplication. Reuses EMAIL_OWNER_EMAIL /
+ * EMAIL_ALLOWED_EMAIL / EMAIL_WEBAPP_URL from PAYSLIP_EMAIL_WebApp.gs.
+ *******************************************************/
+
+const GSE_EMPLOYEE_MASTER_SPREADSHEET_ID = '1yqQ-edwQzZd0pAlaXCAAZt88MbsHfCf4hCcxti4ojCw';
+const GSE_EMPLOYEE_MASTER_GID = 1874110664;
+
+const GSE_EM_HEADERS = Object.freeze({
+  ID: 'ID.NO',
+  PERSONAL_EMAIL: 'PERSONAL EMAIL ID',
+});
+
+const GSE_LOG_TAB_NAME   = '_GENERATED_LOG';
+const GSE_LOG_STAMP_CELL = 'F1';
+
+/* =========================================================
+   ENTRY POINT (menu-triggered — see PAYSLIP_EMAIL_Menu.gs)
+========================================================= */
+
+function getStaffEmails() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    if (currentUser === EMAIL_OWNER_EMAIL.toLowerCase()) {
+      const result = getStaffEmailsServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      ui.alert('Get Staff Emails', result.message || 'No response received.', ui.ButtonSet.OK);
+      return;
+    }
+
+    if (currentUser === EMAIL_ALLOWED_EMAIL.toLowerCase()) {
+      if (!EMAIL_WEBAPP_URL || EMAIL_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert('Get Staff Emails', 'Web App URL is not configured.', ui.ButtonSet.OK);
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(EMAIL_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'getStaffEmails',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      ui.alert('Get Staff Emails', result.message || 'No response received from Web App.', ui.ButtonSet.OK);
+      return;
+    }
+
+    ui.alert('Get Staff Emails', 'You are not authorized to run this function.', ui.ButtonSet.OK);
+
+  } catch (err) {
+    ui.alert('Get Staff Emails', `Error: ${err && err.message ? err.message : err}`, ui.ButtonSet.OK);
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function getStaffEmailsServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    return { success: false, message: 'Another Get Staff Emails run is already in progress. Please wait and try again.' };
+  }
+
+  try {
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+    const sh = ss.getSheetByName(PES_TAB_NAME);
+    if (!sh) throw new Error(`Missing tab: ${PES_TAB_NAME}`);
+
+    const lastCol = sh.getLastColumn();
+    const headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+    const idx = pesBuildHeaderIndex_(headers);
+
+    const cCode  = pesRequireHeader_(idx, PES_HEADERS.EMP_CODE);
+    const cName  = pesRequireHeader_(idx, PES_HEADERS.NAME);
+    const cEmail = pesRequireHeader_(idx, PES_HEADERS.EMAIL);
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) {
+      gseStampGeneratedLog_(ss);
+      return { success: true, message: 'Staff Email Master has no rows yet — nothing to fetch.' };
+    }
+
+    const data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+    // Build Employee Code -> Personal Email map from Employee Master, ONCE.
+    const emMap = gseBuildEmployeeMasterEmailMap_();
+
+    let filledCount = 0;
+    let alreadyHadEmail = 0;
+    const missing = [];
+
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const sheetRow = i + 2;
+
+      const empCode = String(row[cCode] || '').trim();
+      if (!empCode) continue;
+
+      const existingEmail = String(row[cEmail] || '').trim();
+      if (existingEmail) { alreadyHadEmail++; continue; } // never overwrite
+
+      const name = String(row[cName] || '').trim();
+      const key = gseNormCode_(empCode);
+
+      if (!emMap.has(key)) {
+        missing.push(`${empCode} (${name || 'no name'}) — not found in Employee Master`);
+        continue;
+      }
+
+      const personalEmail = emMap.get(key);
+      if (!personalEmail) {
+        missing.push(`${empCode} (${name || 'no name'}) — no Personal Email ID in Employee Master`);
+        continue;
+      }
+
+      sh.getRange(sheetRow, cEmail + 1).setValue(personalEmail);
+      filledCount++;
+    }
+
+    // Stamp the run marker regardless of outcome — this run happened,
+    // even if some employees are still missing an email.
+    gseStampGeneratedLog_(ss);
+
+    const messageParts = [
+      'Get Staff Emails complete.',
+      '',
+      `Filled: ${filledCount}`,
+      `Already had an email (left unchanged): ${alreadyHadEmail}`,
+    ];
+    if (missing.length) {
+      messageParts.push('', `Still missing an email (${missing.length}):`, ...missing);
+    }
+
+    return { success: true, message: messageParts.join('\n') };
+
+  } catch (err) {
+    return { success: false, message: `Error: ${err && err.message ? err.message : err}` };
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/* =========================================================
+   EMPLOYEE MASTER LOOKUP
+========================================================= */
+
+function gseBuildEmployeeMasterEmailMap_() {
+  const emSS = SpreadsheetApp.openById(GSE_EMPLOYEE_MASTER_SPREADSHEET_ID);
+  const emSheet = gseGetSheetByGid_(emSS, GSE_EMPLOYEE_MASTER_GID);
+  if (!emSheet) throw new Error('Employee Master sheet not found by GID.');
+
+  const lastRow = emSheet.getLastRow();
+  const lastCol = emSheet.getLastColumn();
+  const map = new Map();
+  if (lastRow < 2 || lastCol < 1) return map;
+
+  const headers = emSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = pesBuildHeaderIndex_(headers);
+
+  const cId    = pesRequireHeader_(idx, GSE_EM_HEADERS.ID);
+  const cEmail = pesRequireHeader_(idx, GSE_EM_HEADERS.PERSONAL_EMAIL);
+
+  const data = emSheet.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  data.forEach((row) => {
+    const code = String(row[cId] || '').trim();
+    if (!code) return;
+    const email = String(row[cEmail] || '').trim();
+    map.set(gseNormCode_(code), email); // '' allowed — means found but blank
+  });
+
+  return map;
+}
+
+function gseGetSheetByGid_(ss, gid) {
+  const sheets = ss.getSheets();
+  for (const sh of sheets) {
+    if (sh.getSheetId() === gid) return sh;
+  }
+  return null;
+}
+
+function gseNormCode_(v) {
+  return String(v || '').trim().toUpperCase();
+}
+
+/* =========================================================
+   _GENERATED_LOG STAMP (guard marker read by Send script)
+========================================================= */
+
+function gseStampGeneratedLog_(ss) {
+  const sh = ss.getSheetByName(GSE_LOG_TAB_NAME);
+  if (!sh) throw new Error(`Missing tab: ${GSE_LOG_TAB_NAME} — cannot stamp Get Staff Emails completion.`);
+
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+  sh.getRange(GSE_LOG_STAMP_CELL).setValue(stamp);
+}

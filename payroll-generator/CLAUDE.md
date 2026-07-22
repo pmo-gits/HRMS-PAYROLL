@@ -1,0 +1,59 @@
+# payroll-generator/
+
+The core 9-stage payroll pipeline, `PAYROLL_GEN_1` through `PAYROLL_GEN_10`. This is the most consequential module in the workspace — Generate Locked Payroll (file 6) is a point-of-no-return step with cross-spreadsheet side effects. See root [CLAUDE.md](../CLAUDE.md) for cross-cutting principles (all of them apply directly here — this module is where most were learned).
+
+## Pipeline order and files
+
+| File | Function(s) | Role |
+|---|---|---|
+| `1.GLOBAL CONSTANTS` | — | The `CONST` object: all IDs, sheet/tab names, header maps, thresholds. No logic. |
+| `4.VALIDATE ATTENDANCE` | `validateAttendance()` / `validateAttendanceServer_()` | Gate before anything else runs. Locates `Attendance_<Month>_<Year>`, checks lock flags, validates every tab (headers, blanks, numeric sanity), writes META keys `PAYROLL_MONTH_LABEL`, `ATTENDANCE_FILE_ID`, `ATTENDANCE_LAST_UPDATED`, `ATTENDANCE_VALIDATION`. |
+| `2.GET PAYROLL DATA` | `getPayrollData()` / `getPayrollDataServer_()` | Re-checks the same META gates plus staleness (Drive `lastUpdated` vs stored). Pulls Attendance tabs + Employee Master (incl. Aadhaar No) + Salary Revision History + Petrol Conveyance History into `PAY_ROLL` per `CONST.MAP`. Protects the tab except "Payroll Release Confirmation" / "Bank Transfer Mark Down". |
+| `5.Validate Payroll` | `validatePayroll()` / `validatePayrollServer_()` | Cross-checks fixed-salary revision data into `FIXED_SALARY_CHECK` for reconciliation. Informational — does not feed back into `PAY_ROLL`. Fully protects the tab afterward. |
+| `6.Generate Locked Payroll` | `generateLockedPayroll()` / `generateLockedPayrollServer_()` | **The point of no return.** All-or-nothing lock: prechecks, snapshots the whole spreadsheet to a values-only locked copy, pushes ledger snapshots (files 8 & 9), protects attendance + workings files, updates Payroll Control Center. Also hosts the module's single `doPost(e)` web-app dispatcher for all stages. |
+| `8.RecoveredLedgerPush` | `glpPushRecoveredLedgerSnapshot_()` | Called from file 6's lock flow — appends locked Salary Advance deduction rows into [salary-advance-master/](../salary-advance-master/CLAUDE.md)'s Recovered Amount Ledger. |
+| `9.LeaveLedgerPush.gs` | `glpPushLeaveLedgerSnapshotAndUpdateBalances_()` | Called from file 6's lock flow — appends an Approved Leave Ledger snapshot, updates EL/CL/SL balances in [leave-master/](../leave-master/CLAUDE.md) (STAFF only), with Dec year-end reset and Mar carry-forward expiry rules. |
+| `7.Generate Bank Transfer File` | `generateBankTransferFile()` / `generateBankTransferFileServer_()` | Runs only after `LOCK_STATUS = LOCKED`. Splits eligible employees into `UNION_BANK` vs `OTHER_BANKS` by IFSC, stamps a "Bank Transfer Mark Down" timestamp. |
+| `10.generate payslips` | `generatePayslipsServer_()` (Workers) / `generateStaffPayslipPdfsServer_()` (Staff) | Runs after Bank Transfer. Eligibility = a real timestamp in "Bank Transfer Mark Down". Workers → Employees/Employees_Hindi tabs (routed by MIGRANT flag); Staff → individual A4 PDFs. |
+| `3.MENU — Payroll Generator` | `onOpen()` | Menus: `Payroll-HR` (Validate Attendance, Get Payroll Data, Generate Payslips), `Payroll-Admin` (Validate Payroll, Generate Locked Payroll, Generate Bank Transfer File). |
+
+All server functions route through file 6's single `doPost(e)`, keyed by `payload.action` (`generateLockedPayroll`, `getPayrollData`, `validateAttendance`, `validatePayroll`, `generateBankTransferFile`, `generatePayslips`).
+
+## Key global constants (`1.GLOBAL CONSTANTS` → `CONST`)
+
+- `FOLDERS`: `MONTHLY_PAYROLL_WORKINGS`, `MONTHLY_ATTENDANCE`, `LOCKED_PAYROLL_FILES`, `BANK_TRANSFER_FILES`.
+- `SOURCES`: `EMPLOYEE_MASTER_SS_ID`, `SALARY_REVISION_HISTORY_SS_ID`, `PAYROLL_CONTROL_CENTER_SS_ID`, `LEAVE_MASTER_SS_ID`, `SALARY_ADVANCE_MASTER_SS_ID`.
+- `TABS`: EMPLOYEE_MASTER, REVISION_HISTORY, PETROL_CONVEYANCE_HISTORY, ATTENDANCE_ENTRY, LATE_ENTRY, OT_ENTRY, CARRY_FORWARDED, OTHER_PAYMENTS, OTHER_DEDUCTIONS, SALARY_ADVANCE_DEDUCTIONS, META_DATA, FIXED_SALARY_CHECK, PAYROLL_CONTROL_CENTER, UNION_BANK, OTHER_BANKS, LEAVE_MASTER, RECOVERED_AMOUNT_LEDGER.
+- `LEAVE.LEAVE_MASTER_SHEET_ID=0`, `APPROVED_LEAVE_LEDGER_SHEET_ID=1577916656` — GID-based, not name-based.
+- `KEYS.PAYROLL='Employee Code'`; `ATTENDANCE_TABS`/`MASTER_TABS` map each tab to its own key header (`Employee Code` vs `ID.NO` — **these differ**, don't assume a single join key across sheets).
+- `MAP` — the central header-to-source mapping driving Get Payroll Data. Includes `'Aadhaar No': { sheet: 'EMPLOYEE_MASTER', tab: 'Employee Master', targetHeader: 'AADHAAR NO' }` — written to `PAY_ROLL` alongside the other Employee Master identifier columns (Bank Account No, UAN No, ESI No, IFSC Code), same Plain-Text-preserving path.
+- `NON_SCRIPT_COLUMNS` — formula-driven `PAY_ROLL` columns (Gross, Earned*, Total Earnings, PF/ESI/TDS, NET, etc.) that script code must **never** clear or overwrite.
+- `LOCK_RULES`: `LOCKED_FILE_PREFIX='Payroll-Locked'`, `OWNER_EMAIL='pmo@butlerleather.com'`, `VIEWER_EMAILS`.
+- `VALUES`: `LOCK_STATUS_OPEN/LOCKED`, `PAYROLL_RELEASE_PROCEED/HOLD`.
+- Legacy compat constants prefixed `GLP_` still in use (`GLP_SALARY_ADVANCE_MASTER_ID`, `GLP_LEAVE_MASTER_SPREADSHEET_ID`, etc.) — don't assume a missing `GLP_` prefix means the value is unused.
+
+## Non-obvious patterns
+
+- **Header-name-based lookups everywhere**, but `buildHeaderIndex_`/`norm_` is **reimplemented per file** (`btfBuildHeaderIndex_`, `psgBuildHeaderIndex_`, `buildHeaderIndexMap_`) with slightly different signatures (Map vs plain object) rather than shared. If fixing a header-lookup bug, check whether it's duplicated elsewhere before assuming one fix covers all stages.
+- **All-or-nothing locking pattern with manual rollback** (file 6): wrapped in `LockService.getScriptLock()` + try/catch/finally. Explicit compensating-transaction helpers (`glpRollbackSalaryAdvanceUpdatePayload_`, `glpRollbackMetaUpdatePayload_`, trashing the newly created locked file) run if any step after the Drive copy fails — Apps Script has no real cross-service transactions, this is the manual substitute.
+- **`normalizeNumberIfPossible_()` must never run on identifier columns.** File 2 defines `TEXT_PRESERVE_HEADERS` (Bank Account No, UAN No, ESI No, IFSC Code), force-set to Plain Text (`setNumberFormat('@')`) before writing. File 7 reapplies the same `'@'` format on Employee Code/Bank Account No/IFSC in the bank transfer output. **Aadhaar No is not currently in `TEXT_PRESERVE_HEADERS`** — see below.
+- **Aadhaar No is written to `PAY_ROLL` via `CONST.MAP` only — no duplicate-check exists.** A duplicate-Aadhaar precheck (`gpdFindDuplicateAadhaar_`) was drafted in chat during the Aadhaar rollout but was **never actually added to this file** — confirmed by direct grep of the file on 2026-07-21 (zero matches for "Aadhaar" outside the `CONST.MAP` entry). Verified manually against production data instead (no duplicates found in a live run) and the team decided not to add the precheck. If duplicate-Aadhaar protection is wanted later, it needs to be built from scratch, not assumed present. Also note: since Aadhaar No isn't in `TEXT_PRESERVE_HEADERS`, it currently goes through `normalizeNumberIfPossible_()` like a regular number — meaning leading zeros or 16+ digit precision could be at risk (see the `normalizeNumberIfPossible_` principle above) if any employee's Aadhaar No happens to start with a zero. Worth revisiting if that turns out to matter in practice.
+- **Timestamp-as-text pattern**: `setMetaValueAsText_` (file 4) writes `ATTENDANCE_LAST_UPDATED` with number format `'@STRING@'` so Sheets can't reinterpret it as a date/time and strip a leading zero — Get Payroll Data does a strict string comparison against Drive's `getLastUpdated()`, so any reformatting here breaks that gate silently.
+- **Protection carve-outs repeat at three stages**: `PAY_ROLL` stays fully protected except "Payroll Release Confirmation" and "Bank Transfer Mark Down" — file 2's `gpdProtectPayrollTab_`, file 6's `glpProtectWorkingsFileExceptReleaseAndBankMarkDownColumns_`, and file 7's `btfProtectPayrollTransferColumnsByBlocks_` (block-level, only the rows just transferred, via `btfBuildContinuousRowBlocks_` for efficiency).
+- **Payslip layout is baked-in offsets** (file 10): `PSG.WORKER_LANDSCAPE`/`PSG.STAFF` define `BLOCK_ROWS`/`STRIDE`/`BULK_COLS`/`IMG_COLS`/`PERBLOCK_COLS`/`PERBLOCK_ROWS`. Each employee's payslip is a fixed-height block (25 rows Workers landscape A5, 32 rows Staff) copied via `templateBlock.copyTo()`; row heights preserved via `psgReadRowHeightRuns_`/`psgApplyRowHeightRuns_`, which **must be scoped to `STRIDE` not `BLOCK_ROWS`** or spacer-row heights won't replicate (see root CLAUDE.md). Field writes are hardcoded matrix-index (e.g. `m[5][1] = g('Employee Code')`) — fragile to template layout changes; the template file itself is the single source of truth for visual formatting, never set programmatically here.
+- **Idempotency**: Get Payroll Data clears only script-managed columns (`clearScriptColumns_`), never `NON_SCRIPT_COLUMNS` formulas. Bank Transfer and Payslip generation are append-only/re-runnable — marked rows (Bank Transfer Mark Down) or a log tab (`_GENERATED_LOG` for Workers, "PDF File ID" in Staff Email Master) prevent double-processing.
+- **User-gate pattern repeated in every stage file**: owner (`pmo@butlerleather.com`) runs directly; a named delegate (varies per stage — `hrassist@`, `nazneen@`) runs via a shared Web App URL (`GLP_WEBAPP_URL`/`GPD_WEBAPP_URL`/`PSG_WEBAPP_URL` — all point to the same deployed URL); everyone else is blocked.
+
+## Data flow
+
+Validate Attendance (4) → writes META pointers → Get Payroll Data (2) pulls Attendance + Employee Master + Revision History + Petrol Conveyance into `PAY_ROLL` → Validate Payroll (5) reconciles into `FIXED_SALARY_CHECK` (informational only) → Generate Locked Payroll (6) prechecks totals/balances, snapshots to a values-only locked file, pushes ledgers to Salary Advance Master (8) and Leave Master (9), sets `LOCK_STATUS=LOCKED` → Generate Bank Transfer File (7) reads `PAY_ROLL` (only once locked), writes `UNION_BANK`/`OTHER_BANKS`, stamps "Bank Transfer Mark Down" → Generate Payslips (10) reads rows with that mark-down, produces Worker tabs and Staff PDFs.
+
+## Dependencies
+
+- [attendance/](../attendance/CLAUDE.md) — file `Attendance_<Month>_<Year>`, tabs Attendance entry, Late Entry, OT Entry, Carry Forwarded, Other Payments, Other Deductions, Salary Advance deductions.
+- **Employee Master** (`EMPLOYEE_MASTER_SS_ID`, key `ID.NO`) — Skill Group, UAN/ESI No, Bank Account No, IFSC Code, `MIGRANT` flag (routes Worker payslips).
+- **Salary Revision History** (`SALARY_REVISION_HISTORY_SS_ID`) — tabs `REVISION_HISTORY` and `PETROL-CONVEYANCE_HISTORY`; as-of-month selection logic (`pickRevisionAsOf_`/`pickPetrolAsOf_`) is duplicated between files 2 and 5. See [salary-revision-history/](../salary-revision-history/CLAUDE.md).
+- **Salary Advance Master** (`SALARY_ADVANCE_MASTER_SS_ID` / `GLP_SALARY_ADVANCE_MASTER_ID`) — receives Recovered Amount Ledger pushes from file 8. See [salary-advance-master/](../salary-advance-master/CLAUDE.md).
+- **Leave Master** (`LEAVE_MASTER_SS_ID` / `GLP_LEAVE_MASTER_SPREADSHEET_ID`) — balances updated by file 9, read by file 10 for Staff payslip leave display. See [leave-master/](../leave-master/CLAUDE.md).
+- **Payroll Control Center** (`PAYROLL_CONTROL_CENTER_SS_ID`) — updated by files 6 and 7. See [payroll-control-center/](../payroll-control-center/CLAUDE.md).
+- **Payslip Template** (`PSG.TEMPLATE_FILE_ID`, file 10) — copied per month into `PSG.FOLDER_ID`; contains `Employees`, `Employees_Hindi`, `Staffs`, `Staff Email Master` tabs, consumed downstream by [payslip-template/](../payslip-template/CLAUDE.md)'s email-send step.

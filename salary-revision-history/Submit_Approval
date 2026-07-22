@@ -1,0 +1,429 @@
+/************************************************
+ * Submit_Approval.gs
+ * Salary Revision — Spreadsheet-bound Apps Script
+ *
+ * submitForApproval()        — entry point called by Menu.gs
+ *                              user gate: pmo runs core directly,
+ *                              hrassist routes via Web App, others blocked
+ * submitForApprovalCore_()   — core logic + duplicate-Aadhaar / no-baseline-increment guardrails
+ * submitForApprovalServer_() — Web App server handler
+ *
+ * Requires the Sheets Advanced Service ("Sheets API") enabled on this project
+ * (Extensions > Apps Script > Services) — same requirement as the attendance
+ * module's Employee Master fetch.
+ ************************************************/
+
+const EMP_MASTER_SPREADSHEET_ID_ = '1yqQ-edwQzZd0pAlaXCAAZt88MbsHfCf4hCcxti4ojCw';
+const EMP_MASTER_SHEET_ID_ = 1874110664;
+
+/**
+ * Reads Employee Master and returns a Map keyed by normalized ID.NO -> { status, aadhaar, name }.
+ * Mirrors attendance/07_EmployeeMaster_Fetch.gs's Sheets Advanced Service + cached-title pattern.
+ */
+function _fetchEmployeeMasterIndex_() {
+  const cache = CacheService.getScriptCache();
+  const titleCacheKey = `EMP_SHEET_TITLE_${EMP_MASTER_SPREADSHEET_ID_}_${EMP_MASTER_SHEET_ID_}`;
+  let sheetTitle = cache.get(titleCacheKey);
+
+  if (!sheetTitle) {
+    const meta = Sheets.Spreadsheets.get(EMP_MASTER_SPREADSHEET_ID_, {
+      fields: "sheets(properties(sheetId,title))"
+    });
+    const found = (meta.sheets || []).find(s => s.properties && s.properties.sheetId === EMP_MASTER_SHEET_ID_);
+    if (!found) throw new Error("Employee Master sheet not found by sheetId. Check EMP_MASTER_SHEET_ID_.");
+    sheetTitle = found.properties.title;
+    cache.put(titleCacheKey, sheetTitle, 21600);
+  }
+
+  const range = `${sheetTitle}!A1:AR`;
+  const res = Sheets.Spreadsheets.Values.get(EMP_MASTER_SPREADSHEET_ID_, range);
+  const values = res.values || [];
+  const index = new Map();
+  if (values.length < 2) return index;
+
+  const headers = (values[0] || []).map(h => String(h).trim().toUpperCase());
+  const idx0 = (name) => headers.indexOf(name);
+
+  const iId      = idx0("ID.NO");
+  const iName    = idx0("NAME");
+  const iStatus  = idx0("STATUS");
+  const iAadhaar = idx0("AADHAAR NO");
+
+  if (iId === -1 || iStatus === -1 || iAadhaar === -1) {
+    throw new Error("Employee Master headers don't match expected names (ID.NO, STATUS, AADHAAR NO).");
+  }
+
+  const normEmpId_ = (v) =>
+    String(v || '').trim().replace(/\s+/g, '').replace(/[‐-‒–—−]/g, '-').toUpperCase();
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r] || [];
+    const idNo = normEmpId_(row[iId]);
+    if (!idNo) continue;
+    index.set(idNo, {
+      status  : String(row[iStatus] || '').trim().toUpperCase(),
+      aadhaar : String(row[iAadhaar] || '').trim(),
+      name    : iName !== -1 ? String(row[iName] || '').trim() : '',
+    });
+  }
+  return index;
+}
+
+/**
+ * ENTRY POINT — called by Menu.gs
+ * User gate: pmo runs core directly, hrassist routes via Web App, others blocked.
+ */
+function submitForApproval() {
+  const user = Session.getActiveUser().getEmail().toLowerCase().trim();
+  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (user === OWNER_EMAIL_) {
+    const result = submitForApprovalCore_();
+    _showBlockedAlert_(result);
+    return;
+  }
+
+  if (user === HR_ASSIST_EMAIL_) {
+    _callWebApp_('submitForApproval', ss);
+    return;
+  }
+
+  ss.toast('You are not authorised to run Submit for Approval.', 'Access Denied', 6);
+}
+
+/**
+ * Shows a ui.alert() dialog listing blocked employees + reasons, if any.
+ * Only called for the pmo-direct path (Web App path relays this text via
+ * submitForApprovalServer_'s returned message instead — see _callWebApp_).
+ */
+function _showBlockedAlert_(result) {
+  if (!result || !result.blocked || !result.blocked.length) return;
+  const lines = result.blocked.map((b) => `⚠ ${b.reason}`).join('\n\n');
+  SpreadsheetApp.getUi().alert('Blocked Employees — Action Required', lines, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * MAIN LOGIC: Submit for Approval + Threaded Email Notification (single ongoing thread)
+ *
+ * - Clears ONLY: ID.NO, REVISION_TYPE, PLANNED GROSS, EFFECTIVE_FROM [MM/DD/YY]
+ * - Email table headers WRAP TEXT (no nowrap)
+ * - Submit only rows where SUBMIT_STATUS = OK
+ * - Shows summary: submitted / skipped
+ */
+function submitForApprovalCore_(bypassTabGuard, ssOverride) {
+  const ss = ssOverride || SpreadsheetApp.getActiveSpreadsheet();
+
+  const SRC_SHEET_NAME = 'HR_UPDATE';
+  const DST_SHEET_NAME = 'REVISION_APPROVAL';
+
+  // Email config
+  const EMAIL_TO       = 'nazneen@butlerleather.com';
+  const EMAIL_REPLY_TO = 'hrassist@butlerleather.com';
+  const EMAIL_SUBJECT  = 'Salary Revision Approval Request [SR-APPROVAL]';
+  const EMAIL_MESSAGE  =
+    'Salary revision request have been submitted for the employees listed below. Kindly review and share your approval/comments.';
+
+  // Must run from HR_UPDATE tab only (skipped when called from server handler)
+  if (!bypassTabGuard) {
+    const active = ss.getActiveSheet();
+    if (!active || active.getName() !== SRC_SHEET_NAME) {
+      ss.toast(`Skipped: open "${SRC_SHEET_NAME}" tab and run again.`, 'Submit for Approval', 6);
+      return { submittedCount: 0, skippedCount: 0, blocked: [] };
+    }
+  }
+
+  const src = ss.getSheetByName(SRC_SHEET_NAME);
+  const dst = ss.getSheetByName(DST_SHEET_NAME);
+  if (!src || !dst) {
+    throw new Error(
+      'Missing required sheet(s). Check exact tab names: HR_UPDATE and REVISION_APPROVAL.'
+    );
+  }
+
+  const srcLastRow = src.getLastRow();
+  const srcLastCol = src.getLastColumn();
+  if (srcLastRow < 2) return { submittedCount: 0, skippedCount: 0, blocked: [] };
+
+  const dstLastCol = dst.getLastColumn();
+
+  const norm = (h) => String(h || '').trim().replace(/\s+/g, ' ').toUpperCase();
+
+  const srcHeaders = src.getRange(1, 1, 1, srcLastCol).getDisplayValues()[0];
+  const dstHeaders = dst.getRange(1, 1, 1, dstLastCol).getDisplayValues()[0];
+
+  const srcIdx = new Map();
+  srcHeaders.forEach((h, i) => srcIdx.set(norm(h), i));
+
+  const dstIdx = new Map();
+  dstHeaders.forEach((h, i) => dstIdx.set(norm(h), i));
+
+  const HR_INPUT_SRC = [
+    'ID.NO',
+    'BASIC',
+    'DA',
+    'HRA',
+    'CONV.ALL',
+    'SPL.ALL',
+    'EFFECTIVE_FROM [MM/DD/YY]',
+    'REVISION_TYPE',
+  ].map(norm);
+
+  const CLEAR_ONLY_SRC = [
+    'ID.NO',
+    'REVISION_TYPE',
+    'PLANNED GROSS',
+    'EFFECTIVE_FROM [MM/DD/YY]',
+  ].map(norm);
+
+  const SRC_EFF           = norm('EFFECTIVE_FROM [MM/DD/YY]');
+  const DST_EFF           = norm('EFFECTIVE_FROM');
+  const SRC_SUBMIT_STATUS = norm('SUBMIT_STATUS');
+  const SRC_ID_NO         = norm('ID.NO');
+  const SRC_REVISION_TYPE = norm('REVISION_TYPE');
+  const SRC_OLD_GROSS     = norm('OLD GROSS');
+
+  HR_INPUT_SRC.forEach((h) => {
+    if (!srcIdx.has(h)) throw new Error(`HR_UPDATE missing required column: ${h}`);
+  });
+
+  if (!srcIdx.has(SRC_SUBMIT_STATUS)) {
+    throw new Error('HR_UPDATE missing required column: SUBMIT_STATUS');
+  }
+
+  if (!srcIdx.has(SRC_OLD_GROSS)) {
+    throw new Error('HR_UPDATE missing required column: OLD GROSS');
+  }
+
+  const clearCols = CLEAR_ONLY_SRC.filter((h) => srcIdx.has(h));
+
+  const data = src.getRange(2, 1, srcLastRow - 1, srcLastCol).getDisplayValues();
+
+  const normEmpId_ = (v) =>
+    String(v || '').trim().replace(/\s+/g, '').replace(/[‐-‒–—−]/g, '-').toUpperCase();
+
+  const empIndex = _fetchEmployeeMasterIndex_();
+
+  // Aadhaar -> ACTIVE employee-code entries, for the duplicate-Aadhaar guardrail.
+  const aadhaarToActiveIds = new Map();
+  empIndex.forEach((info, idNo) => {
+    if (info.status !== 'ACTIVE' || !info.aadhaar) return;
+    if (!aadhaarToActiveIds.has(info.aadhaar)) aadhaarToActiveIds.set(info.aadhaar, []);
+    aadhaarToActiveIds.get(info.aadhaar).push({ idNo, name: info.name });
+  });
+
+  const blocked  = [];
+  const eligible = [];
+
+  data.forEach((r, i) => {
+    const requiredFilled = HR_INPUT_SRC.every(
+      (h) => String(r[srcIdx.get(h)] || '').trim() !== ''
+    );
+    const submitStatus = String(r[srcIdx.get(SRC_SUBMIT_STATUS)] || '')
+      .trim()
+      .toUpperCase();
+
+    if (!requiredFilled || submitStatus !== 'OK') return;
+
+    const idNo    = normEmpId_(r[srcIdx.get(SRC_ID_NO)]);
+    const empInfo = empIndex.get(idNo);
+    const empName = empInfo && empInfo.name ? empInfo.name : idNo;
+
+    // Guardrail 1 — Duplicate Aadhaar, active elsewhere.
+    if (empInfo && empInfo.aadhaar) {
+      const matches = (aadhaarToActiveIds.get(empInfo.aadhaar) || [])
+        .filter((e) => e.idNo !== idNo);
+      if (matches.length) {
+        const conflict = matches[0];
+        blocked.push({
+          idNo,
+          name: empName,
+          reason:
+            `Duplicate Aadhaar Detected — Employee code ${idNo} (${empName}) shares the same ` +
+            `Aadhaar No. with ACTIVE code ${conflict.idNo}${conflict.name ? ` (${conflict.name})` : ''}. ` +
+            `Please verify against the old signed salary letter and resolve before submitting.`,
+        });
+        return;
+      }
+    }
+
+    // Guardrail 2 — Increment with no prior salary on record.
+    const revisionType = String(r[srcIdx.get(SRC_REVISION_TYPE)] || '').trim().toUpperCase();
+    const oldGross      = parseFloat(String(r[srcIdx.get(SRC_OLD_GROSS)] || '').replace(/[, ]/g, ''));
+    if (revisionType === 'INCREMENT' && (isNaN(oldGross) || oldGross <= 0)) {
+      blocked.push({
+        idNo,
+        name: empName,
+        reason:
+          `Invalid Revision Type — Employee code ${idNo} has no previous salary on record ` +
+          `(Old Gross is blank/0), so 'Increment' isn't valid here. Please change Revision Type ` +
+          `to 'Salary Fixation' and resubmit.`,
+      });
+      return;
+    }
+
+    eligible.push(i);
+  });
+
+  const skippedCount = data.length - eligible.length - blocked.length;
+
+  if (!eligible.length) {
+    const summary = blocked.length
+      ? `Submitted: 0 | Skipped: ${skippedCount} | Blocked: ${blocked.length}`
+      : `Submitted: 0 | Skipped: ${skippedCount}`;
+    ss.toast(summary, 'Submit for Approval', 7);
+    return { submittedCount: 0, skippedCount, blocked };
+  }
+
+  const now = new Date();
+
+  const outRows = eligible.map((rIdx) => {
+    const r   = data[rIdx];
+    const row = new Array(dstLastCol).fill('');
+
+    dstIdx.forEach((dIdx, key) => {
+      if (key === norm('REQUESTED_ON'))                  row[dIdx] = now;
+      else if (key === DST_EFF && srcIdx.has(SRC_EFF))  row[dIdx] = r[srcIdx.get(SRC_EFF)];
+      else if (srcIdx.has(key))                          row[dIdx] = r[srcIdx.get(key)];
+    });
+
+    return row;
+  });
+
+  // Append to REVISION_APPROVAL
+  dst.getRange(dst.getLastRow() + 1, 1, outRows.length, dstLastCol).setValues(outRows);
+
+  // Clear only requested columns for submitted rows
+  eligible.forEach((rIdx) => {
+    clearCols.forEach((h) => {
+      src.getRange(rIdx + 2, srcIdx.get(h) + 1).clearContent();
+    });
+  });
+
+  // -------- EMAIL --------
+  const headers = [
+    'REQUESTED_ON',
+    'ID NO',
+    'NAME',
+    'CATEGORY',
+    'DEPARTMENT',
+    'DESIGNATION',
+    'GROSS',
+    'CHANGE OF VALUE',
+    '% OF CHANGE',
+    'EFFECTIVE_FROM',
+    'REVISION_TYPE',
+    'PREV_EFFECTIVE_FROM',
+  ];
+
+  const tz = ss.getSpreadsheetTimeZone();
+
+  const escape = (s) =>
+    String(s || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+  const fmt2 = (v, pct) => {
+    const n = parseFloat(String(v).replace(/[% ,]/g, ''));
+    if (isNaN(n)) return v;
+    return pct ? `${n.toFixed(2)}%` : n.toFixed(2);
+  };
+
+  const tableHeader =
+    '<tr>' +
+    headers
+      .map(
+        (h) =>
+          `<th style="border:1px solid #ccc;padding:6px;white-space:normal;word-wrap:break-word;">${h}</th>`
+      )
+      .join('') +
+    '</tr>';
+
+  const tableRows = outRows
+    .map((r) => {
+      return (
+        '<tr>' +
+        headers
+          .map((h) => {
+            const key = h === 'ID NO' ? 'ID.NO' : h;
+            let val   = r[dstIdx.get(norm(key))] || '';
+            if (h === 'GROSS' || h === 'CHANGE OF VALUE') val = fmt2(val, false);
+            if (h === '% OF CHANGE') val = fmt2(val, true);
+            if (val instanceof Date)
+              val = Utilities.formatDate(val, tz, 'dd-MMM-yyyy HH:mm');
+            return `<td style="border:1px solid #ccc;padding:6px;">${escape(val)}</td>`;
+          })
+          .join('') +
+        '</tr>'
+      );
+    })
+    .join('');
+
+  const html =
+    `<div style="font-family:Arial;font-size:13px;">` +
+    `<div>${EMAIL_MESSAGE}</div><br>` +
+    `<b>Submitted on ${Utilities.formatDate(new Date(), tz, 'dd-MMM-yyyy HH:mm')}</b><br><br>` +
+    `<table style="border-collapse:collapse;width:100%;">` +
+    tableHeader +
+    tableRows +
+    `</table></div>`;
+
+  // ── FIXED: avoid reply/replyAll entirely — both bleed hrassist into To/CC
+  // because it's baked into the thread as a prior sender/recipient.
+  // Instead send a fresh GmailApp.sendEmail with Re: subject prefix so Gmail
+  // groups it visually in the same thread, but To is strictly nazneen only. ──
+  const threads     = GmailApp.search(`subject:"${EMAIL_SUBJECT}"`, 0, 5);
+  const sendSubject = threads.length ? `Re: ${EMAIL_SUBJECT}` : EMAIL_SUBJECT;
+
+  GmailApp.sendEmail(EMAIL_TO, sendSubject, '', {
+    htmlBody : html,
+    replyTo  : EMAIL_REPLY_TO,
+    name     : 'Butler Leather HR',
+  });
+
+  const finalSummary = blocked.length
+    ? `Submitted: ${eligible.length} | Skipped: ${skippedCount} | Blocked: ${blocked.length}`
+    : `Submitted: ${eligible.length} | Skipped: ${skippedCount}`;
+
+  ss.toast(finalSummary, 'Submit for Approval', 7);
+
+  return { submittedCount: eligible.length, skippedCount, blocked };
+}
+
+// ─── Web App Server Handler ────────────────────────────────────────────────────
+/**
+ * Called by doPost in WebApp Router.gs when action = "submitForApproval".
+ * Opens the spreadsheet by ID (runs as owner/pmo) and calls submitForApprovalCore_().
+ */
+function submitForApprovalServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  if (!spreadsheetId) {
+    return { success: false, message: 'Missing spreadsheetId in payload.' };
+  }
+
+  try {
+    const ss = SpreadsheetApp.openById(spreadsheetId);
+
+    const hrSheet = ss.getSheetByName('HR_UPDATE');
+    if (!hrSheet) {
+      return { success: false, message: 'Sheet HR_UPDATE not found in spreadsheet.' };
+    }
+
+    const result = submitForApprovalCore_(true, ss); // bypassTabGuard + pass ss opened by ID
+
+    let message = `Submitted: ${result.submittedCount} | Skipped: ${result.skippedCount}`;
+    if (result.blocked && result.blocked.length) {
+      message +=
+        ` | Blocked: ${result.blocked.length}\n\n` +
+        result.blocked.map((b) => `⚠ ${b.reason}`).join('\n\n');
+    }
+
+    return { success: true, message };
+
+  } catch (err) {
+    return {
+      success: false,
+      message: `submitForApproval error: ${err && err.message ? err.message : err}`,
+    };
+  }
+}

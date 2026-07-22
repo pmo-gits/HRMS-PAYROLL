@@ -1,0 +1,37 @@
+/**
+ * Payroll Generator - Menus
+ * Creates 2 separate top-level menus:
+ * 1) Payroll-HR
+ * 2) Payroll-Admin
+ *
+ * NOTE:
+ * - Keep ONLY ONE onOpen() in the project.
+ * - Do not duplicate onOpen elsewhere.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  // -----------------------------
+  // Payroll-HR Menu
+  // -----------------------------
+  ui.createMenu('Payroll-HR')
+    .addItem('Validate Attendance', 'validateAttendance')
+    .addSeparator()
+    .addItem('Get Payroll Data', 'getPayrollData')
+    .addSeparator()
+    .addItem('Generate Payslips', 'generatePayslips')
+    .addSeparator()
+    .addToUi();
+
+  // -----------------------------
+  // Payroll-Admin Menu
+  // -----------------------------
+  ui.createMenu('Payroll-Admin')
+    .addItem('Validate Payroll', 'validatePayroll')
+    .addSeparator()
+    .addItem('Generate Locked Payroll', 'generateLockedPayroll')
+    .addSeparator()
+    .addItem('Generate Bank Transfer File', 'generateBankTransferFile')
+    .addSeparator()
+    .addToUi();
+}
