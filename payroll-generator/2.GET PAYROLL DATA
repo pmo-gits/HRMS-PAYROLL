@@ -11,6 +11,8 @@
  * ✅ ADDITIONAL REQUIRED PRECHECKS (as requested):
  *    5) Attendance -> Salary Advance deductions -> Payroll Status must NOT be "LOCKED"
  *    6) Attendance -> Attendance entry -> LOCKED STATUS must contain "LOCKED"
+ * ✅ NEW PRECHECK:
+ *    7) Duplicate Aadhaar No across employees in this run -> hard stop, no writes to PAY_ROLL
  * ✅ LOCK discipline: if LOCK_STATUS=LOCKED → stop
  * ✅ Header-based mapping only
  * ✅ Idempotent writes, no formula overwrite
@@ -299,6 +301,18 @@ function getPayrollDataServer_(payload) {
 
   const empBridge = buildEmployeeCodeToIdMap_(empMasterSheet);
 
+  // ---- 7B) REQUIRED PRECHECK: Duplicate Aadhaar No across employees in this run ----
+  //          Runs BEFORE any PAY_ROLL write (clear or set). If a duplicate is found,
+  //          the function stops here — nothing in PAY_ROLL is touched.
+  {
+    const attEntryRowsForCheck = attEntry.rowsByKey;
+    const dupResult = gpdFindDuplicateAadhaar_(empCodes, empBridge, attEntryRowsForCheck);
+
+    if (dupResult.hasDuplicates) {
+      return alert_('Get Payroll Data', dupResult.message);
+    }
+  }
+
   // ---- 8) Load Revision + Petrol once ----
   const revSS = SpreadsheetApp.openById(CONST.SOURCES.SALARY_REVISION_HISTORY_SS_ID);
 
@@ -332,6 +346,7 @@ function getPayrollDataServer_(payload) {
     norm_('UAN No'),
     norm_('ESI No'),
     norm_('IFSC Code'),
+    norm_('Aadhaar No'),
   ]);
 
   // ---- 10) Write script columns per CONST.MAP ----
@@ -734,6 +749,58 @@ function buildEmployeeCodeToIdMap_(empMasterSheet) {
   };
 
   return { codeToId, pick };
+}
+
+/* ===========================
+   Helpers — Aadhaar No duplicate precheck
+   Scoped to the current run's employee set only (empCodes for this month).
+   Blank/missing Aadhaar No is skipped, not treated as a duplicate or an error
+   (Aadhaar No is mandatory for Active status in Employee Master, so blanks are
+   not expected in practice — this is just a defensive skip, not a rule).
+   Comparison strips spaces so "1234 5678 9012" and "123456789012" are treated
+   as the same number; the alert displays the value exactly as stored.
+=========================== */
+
+function gpdFindDuplicateAadhaar_(empCodes, empBridge, attEntryRows) {
+  const groups = new Map(); // normalized aadhaar -> [{ empCode, name, aadhaarDisplay }]
+
+  empCodes.forEach((empCode) => {
+    const idno = empBridge.codeToId.get(empCode) || '';
+    if (!idno) return;
+
+    const aadhaarRaw = String(empBridge.pick(idno, 'AADHAAR NO') || '').trim();
+    if (!aadhaarRaw) return; // blank -> skip, not a duplicate
+
+    const aadhaarKey = aadhaarRaw.replace(/\s+/g, '');
+    const name = pickByHeader_(attEntryRows.get(empCode), 'Name');
+
+    if (!groups.has(aadhaarKey)) groups.set(aadhaarKey, []);
+    groups.get(aadhaarKey).push({ empCode, name, aadhaarDisplay: aadhaarRaw });
+  });
+
+  const dupGroups = [];
+  groups.forEach((members) => {
+    if (members.length > 1) dupGroups.push(members);
+  });
+
+  if (!dupGroups.length) {
+    return { hasDuplicates: false, message: '' };
+  }
+
+  const lines = dupGroups.map((members) => {
+    const aadhaar = members[0].aadhaarDisplay;
+    const who = members
+      .map((m) => `${m.empCode}${m.name ? ' - ' + m.name : ''}`)
+      .join(', ');
+    return `Aadhaar No ${aadhaar}: ${who}`;
+  });
+
+  const message =
+    'Duplicate Aadhaar No found across employees. Payroll data was NOT loaded.\n\n' +
+    lines.join('\n') +
+    '\n\nFix Employee Master / Employee Codes, then re-run Get Payroll Data.';
+
+  return { hasDuplicates: true, message };
 }
 
 /* ===========================
