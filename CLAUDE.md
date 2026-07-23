@@ -54,6 +54,10 @@ Individual `.gs` files inside these folders still carry their production prefixe
 - Google Apps Script + Google Sheets. Native Apps Script Web App hosting (`doGet` + `HtmlService` + `google.script.run`) is the default — evaluate this before any external hosting option.
 - Version control: separate GitHub repo per module.
 
+## Commands
+
+There are none — no `package.json`, no `.clasp.json`, no CI config anywhere in this repo. There is no build, lint, test, or deploy step to run from a shell. Each file here is Apps Script source (`.gs`, or extensionless script files like `payroll-generator/6.Generate Locked Payroll`) mirrored into git purely for version control and review; the actual execution environment is the Google Apps Script editor bound to each spreadsheet/Web App project. "Testing a change" means running the affected menu function against real (or test-copy) spreadsheet data and checking sheet state/logs, not running an automated suite.
+
 ## Key file IDs
 
 - Template Payslip: `1IrcvPh6zASMqxOrBjAZkt_E5lQt_Slj8Lhvpkx9qyOQ`

@@ -77,7 +77,15 @@ function generateLockedPayroll() {
    been removed — exportPayslipPdfsServer_() no longer exists in
    PAYROLL_GEN_10 (PDF export was dropped entirely per PMO), so
    this branch would have thrown "function not defined" if ever
-   called. Everything else below is unchanged.
+   called.
+
+   NEW: 'generateStaffPayslipPdfs' branch added below — calls
+   generateStaffPayslipPdfsServer_(), which lives in PAYROLL_GEN_10
+   (same Apps Script project as this file), same pattern as the
+   existing 'generatePayslips' branch. Without this branch, the
+   delegate user's Web App call for Staff Payslip PDFs fell through
+   to "Unknown action" (owner-direct runs were unaffected, since
+   they bypass doPost entirely). Everything else below is unchanged.
 ========================================================= */
 
 function doPost(e) {
@@ -99,6 +107,8 @@ function doPost(e) {
       result = generateBankTransferFileServer_(payload);
     } else if (action === 'generatePayslips') {
       result = generatePayslipsServer_(payload);
+    } else if (action === 'generateStaffPayslipPdfs') {
+      result = generateStaffPayslipPdfsServer_(payload);
     } else {
       result = { success: false, message: `Unknown action: "${action}".` };
     }
@@ -538,6 +548,7 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
   const saEmpIdx0 = glpRequireHeaderIndex_(saIdx, CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.SALARY_ADVANCE_DEDUCTIONS], CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
   const saRecoveredIdx0 = glpRequireHeaderIndex_(saIdx, 'Recovered Amount', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
   const saPayrollStatusIdx0 = glpRequireHeaderIndex_(saIdx, 'Payroll Status', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const saPlannedEmiIdx0 = glpRequireHeaderIndex_(saIdx, 'Planned EMI', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
 
   const payrollData = payrollSh.getRange(2, 1, payLastRow - 1, payLastCol).getDisplayValues();
   const salaryAdvanceData = saLastRow >= 2
@@ -558,11 +569,17 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
     };
   }
 
-  const advanceByEmp = new Map();
+  // NOTE: payAdvIdx0 (PAY_ROLL "Advance Deduction") is looked up above only to
+  // fail fast if that header is ever missing. Its per-row value is intentionally
+  // NOT used below — Recovered Amount is now sourced per-row from this same
+  // sheet's own "Planned EMI" column (see loop below), not from the employee-level
+  // combined total, so that employees with multiple EMI rows get each row's own
+  // correct amount instead of the shared total repeated on every row.
+  const empCodesInPayroll = new Set();
   for (let i = 0; i < payrollData.length; i++) {
     const empCode = String(payrollData[i][payEmpIdx0] || '').trim();
     if (!empCode) continue;
-    advanceByEmp.set(empCode, payrollData[i][payAdvIdx0]);
+    empCodesInPayroll.add(empCode);
   }
 
   const recoveredValues          = [];
@@ -584,7 +601,7 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
       continue;
     }
 
-    recoveredValues.push([advanceByEmp.has(empCode) ? advanceByEmp.get(empCode) : '']);
+    recoveredValues.push([empCodesInPayroll.has(empCode) ? salaryAdvanceData[i][saPlannedEmiIdx0] : '']);
     payrollStatusValues.push([CONST.VALUES.LOCK_STATUS_LOCKED]);
   }
 
