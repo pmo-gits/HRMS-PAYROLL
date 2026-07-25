@@ -170,6 +170,7 @@ const CONST = Object.freeze({
     'TDS',
     'Total Deductions',
     'NET',
+    'Advance Recovery Capacity',
   ]),
 
   META_KEYS: Object.freeze({

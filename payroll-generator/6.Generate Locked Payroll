@@ -16,11 +16,14 @@ function generateLockedPayroll() {
 
     // ── Owner: run directly ──
     if (currentUser === GLP_OWNER_EMAIL.toLowerCase()) {
-      generateLockedPayrollServer_({
+      const result = generateLockedPayrollServer_({
         spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
         requestedBy: currentUser,
         runMode: 'direct',
       });
+      if (result && result.message) {
+        ui.alert('Generate Locked Payroll', result.message, ui.ButtonSet.OK);
+      }
       return;
     }
 
@@ -241,7 +244,8 @@ function generateLockedPayrollServer_(payload) {
 
     try {
       glpAssertAdvanceDeductionTotalMatchesPlannedEmi_(meta, salaryAdvanceSh);
-      glpAssertNegativeBalanceEmployeesCleared_(meta);               // ── NEW PRECHECK ──
+      glpAssertHrDecisionConsistentPerEmployee_(salaryAdvanceSh);     // ── NEW PRECHECK, non-negotiable ──
+      glpAssertNegativeBalanceEmployeesCleared_(meta);
       glpAssertMetaGrossTotalPayrollMatchesSalaryMaster_(meta);
     } catch (err) {
       return { success: false, message: err.message };
@@ -383,7 +387,7 @@ function glpAssertSalaryAdvancePayrollNotLocked_(salaryAdvanceSh) {
 
   for (let i = 0; i < values.length; i++) {
     const v = String(values[i][0] || '').trim().toUpperCase();
-    if (v === CONST.VALUES.LOCK_STATUS_LOCKED) {
+    if (v.startsWith(CONST.VALUES.LOCK_STATUS_LOCKED)) {
       throw new Error('Salary Advance deductions already has Payroll Status = LOCKED. Duplicate payroll lock blocked.');
     }
   }
@@ -423,6 +427,71 @@ function glpAssertNegativeBalanceEmployeesCleared_(metaSh) {
   if (salaryMasterStatus !== 'PROCEED') {
     throw new Error(
       'Negative net pay detected. Check Attendance and update HR Decision.'
+    );
+  }
+}
+
+/* =========================================================
+   NEW PRECHECK: HR DECISION MUST BE CONSISTENT ACROSS AN
+   EMPLOYEE'S EMI ROWS (SAME MONTH)
+   — Non-negotiable: this function reads no PROCEED/override value
+   of any kind (unlike glpAssertNegativeBalanceEmployeesCleared_'s
+   "Salary Master Status = PROCEED" override), so there is no way
+   for a mismatch to be bypassed.
+========================================================= */
+
+function glpAssertHrDecisionConsistentPerEmployee_(salaryAdvanceSh) {
+  const lastRow = salaryAdvanceSh.getLastRow();
+  const lastCol = salaryAdvanceSh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return;
+
+  const headers = salaryAdvanceSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const empIdx0  = glpRequireHeaderIndex_(idx, 'Employee Code', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const nameIdx0 = glpRequireHeaderIndex_(idx, 'Name', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const refIdx0  = glpRequireHeaderIndex_(idx, 'EMI Reference Number', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const hrIdx0   = glpRequireHeaderIndex_(idx, 'HR Decision', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+
+  const values = salaryAdvanceSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  const byEmp = new Map(); // empCode -> { name, rows: [{ ref, decision }] }
+
+  for (let i = 0; i < values.length; i++) {
+    const empCode = String(values[i][empIdx0] || '').trim();
+    if (!empCode) continue;
+
+    const ref = String(values[i][refIdx0] || '').trim();
+    if (!ref) continue;
+
+    const decision = String(values[i][hrIdx0] || '').trim().toUpperCase();
+    const name = String(values[i][nameIdx0] || '').trim();
+
+    if (!byEmp.has(empCode)) byEmp.set(empCode, { name: name, rows: [] });
+    byEmp.get(empCode).rows.push({ ref: ref, decision: decision });
+  }
+
+  const mismatches = [];
+
+  byEmp.forEach((info, empCode) => {
+    if (info.rows.length < 2) return;
+
+    const firstDecision = info.rows[0].decision;
+    const allSame = info.rows.every(r => r.decision === firstDecision);
+    if (allSame) return;
+
+    const detail = info.rows
+      .map(r => `${r.ref}="${r.decision || '(blank)'}"`)
+      .join(', ');
+
+    mismatches.push(`${info.name} (${empCode}): ${detail}`);
+  });
+
+  if (mismatches.length) {
+    throw new Error(
+      `HR Decision mismatch across EMI rows for the same employee. ` +
+      `All EMI rows for one employee must carry the same HR Decision this month. ` +
+      `Fix in "${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS}" before locking: ${mismatches.join(' | ')}`
     );
   }
 }
@@ -524,7 +593,9 @@ function glpToNumber_(value) {
 
 /* =========================================================
    PREPARE / APPLY ATTENDANCE UPDATE
-   — UNCHANGED —
+   — glpPrepareSalaryAdvanceUpdatePayload_ caps Recovered Amount to
+   PAY_ROLL's "Advance Recovery Capacity" (2026-07-25); everything
+   else in this block (apply/rollback) is unchanged.
 ========================================================= */
 
 function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, lockedOnText) {
@@ -544,6 +615,7 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
 
   const payEmpIdx0 = glpRequireHeaderIndex_(payIdx, CONST.KEYS.PAYROLL, CONST.TEMPLATES.PAYROLL_TAB_NAME);
   const payAdvIdx0 = glpRequireHeaderIndex_(payIdx, 'Advance Deduction', CONST.TEMPLATES.PAYROLL_TAB_NAME);
+  const payCapacityIdx0 = glpRequireHeaderIndex_(payIdx, 'Advance Recovery Capacity', CONST.TEMPLATES.PAYROLL_TAB_NAME);
 
   const saEmpIdx0 = glpRequireHeaderIndex_(saIdx, CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.SALARY_ADVANCE_DEDUCTIONS], CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
   const saRecoveredIdx0 = glpRequireHeaderIndex_(saIdx, 'Recovered Amount', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
@@ -571,15 +643,16 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
 
   // NOTE: payAdvIdx0 (PAY_ROLL "Advance Deduction") is looked up above only to
   // fail fast if that header is ever missing. Its per-row value is intentionally
-  // NOT used below — Recovered Amount is now sourced per-row from this same
-  // sheet's own "Planned EMI" column (see loop below), not from the employee-level
-  // combined total, so that employees with multiple EMI rows get each row's own
-  // correct amount instead of the shared total repeated on every row.
-  const empCodesInPayroll = new Set();
+  // NOT used below — Recovered Amount is sourced per-row from this same sheet's
+  // own "Planned EMI" column (see loop below), capped at each employee's real
+  // affordability via PAY_ROLL's "Advance Recovery Capacity" column, consumed
+  // sequentially in existing sheet row order across an employee's multiple EMI
+  // rows (first row draws down capacity first, remainder rolls to the next row).
+  const empCapacityByCode = new Map();
   for (let i = 0; i < payrollData.length; i++) {
     const empCode = String(payrollData[i][payEmpIdx0] || '').trim();
     if (!empCode) continue;
-    empCodesInPayroll.add(empCode);
+    empCapacityByCode.set(empCode, glpToNumber_(payrollData[i][payCapacityIdx0]));
   }
 
   const recoveredValues          = [];
@@ -601,7 +674,16 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
       continue;
     }
 
-    recoveredValues.push([empCodesInPayroll.has(empCode) ? salaryAdvanceData[i][saPlannedEmiIdx0] : '']);
+    if (empCapacityByCode.has(empCode)) {
+      const plannedEmi = glpToNumber_(salaryAdvanceData[i][saPlannedEmiIdx0]);
+      const remainingCapacity = empCapacityByCode.get(empCode);
+      const thisRowRecovered = Math.min(plannedEmi, remainingCapacity);
+      empCapacityByCode.set(empCode, remainingCapacity - thisRowRecovered);
+      recoveredValues.push([thisRowRecovered]);
+    } else {
+      recoveredValues.push(['']);
+    }
+
     payrollStatusValues.push([CONST.VALUES.LOCK_STATUS_LOCKED]);
   }
 

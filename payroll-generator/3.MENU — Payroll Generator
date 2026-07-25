@@ -21,6 +21,8 @@ function onOpen() {
     .addSeparator()
     .addItem('Generate Payslips', 'generatePayslips')
     .addSeparator()
+    .addItem('Generate Staff Payslip PDFs', 'generateStaffPayslipPdfs')
+    .addSeparator()
     .addToUi();
 
   // -----------------------------
