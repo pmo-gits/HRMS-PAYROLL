@@ -100,13 +100,21 @@ function clearApprovedLeaveColumns_(sheet, empCount) {
   });
 }
 
-function applyAttendanceDropdownValidation_(sheet, startRow, numRows) {
+function applyAttendanceDropdownValidation_(sheet, startRow, numRows, year, monthIndex0, daysInMonth) {
   const rule = SpreadsheetApp.newDataValidation()
     .requireValueInList(["P", "A", "HD", "LO"], true)
     .setAllowInvalid(false)
     .build();
 
-  sheet.getRange(startRow, DATE_START_COL, numRows, 31).setDataValidation(rule);
+  // Sundays are excluded — those columns get "WO" via
+  // applySundayWOFormattingAndProtection_ and are protected right after,
+  // so they must not carry the P/A/HD/LO-only rule.
+  for (let day = 1; day <= daysInMonth; day++) {
+    const dt = new Date(year, monthIndex0, day);
+    if (dt.getDay() === 0) continue;
+    const col = DATE_START_COL + (day - 1);
+    sheet.getRange(startRow, col, numRows, 1).setDataValidation(rule);
+  }
 }
 
 function fillWOSundaysForRows_(sheet, year, monthIndex0, daysInMonth, startRow, numRows) {
@@ -143,7 +151,11 @@ function applySundayWOFormattingAndProtection_(sheet, year, monthIndex0, daysInM
 
     sheet.getRange(1, col).setBackground("#ff0000");
 
-    if (empCount > 0) sheet.getRange(2, col, empCount, 1).setValue("WO");
+    if (empCount > 0) {
+      const sundayRange = sheet.getRange(2, col, empCount, 1);
+      sundayRange.setDataValidation(null); // Sunday cells are never P/A/HD/LO — clear any stray rule before writing WO
+      sundayRange.setValue("WO");
+    }
 
     const protectRange = sheet.getRange(2, col, Math.max(empCount, 1), 1);
     const protection = protectRange.protect();

@@ -53,6 +53,7 @@ Individual `.gs` files inside these folders still carry their production prefixe
 
 - Google Apps Script + Google Sheets. Native Apps Script Web App hosting (`doGet` + `HtmlService` + `google.script.run`) is the default — evaluate this before any external hosting option.
 - Version control: separate GitHub repo per module.
+- **Commit messages: no `Co-Authored-By` trailer.** Conventional Commits title (`feat:`, `fix:`, `docs:`, `refactor:`) plus an extended body explaining what changed and why — but the body ends at the last content line, with no AI co-author trailer appended. Every message is presented for approval before committing (see `.agents/skills/github-push/SKILL.md`).
 
 ## Commands
 

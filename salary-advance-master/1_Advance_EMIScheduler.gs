@@ -32,6 +32,42 @@
  *    - Single growing protection on EMI_SCHEDULE A2:L{lastRow}
  *      recreated fresh on every successful schedule run (never stacks)
  *
+ * ✅ NEW (v3):
+ *    - Duplicate active EMI guardrail in scheduleEMI_Core_():
+ *      Pre-scan builds a Set of employee codes that already have
+ *      EMI Status = "ACTIVE" in the ledger (formula column, read via
+ *      getDisplayValues). Any new eligible row (no ref yet) whose
+ *      employee code appears in that Set is collected as a blocker.
+ *      If one or more blockers found → entire run is aborted with a
+ *      clear, named alert before Phase 1 field-validation begins.
+ *      All-or-nothing: fix the blocker(s), then re-run for all.
+ *
+ * ✅ NEW (v4) — TEST ENVIRONMENT ONLY, not yet applied to production:
+ *    - The v3 guardrail no longer hard-aborts the run. Instead:
+ *        1. scheduleEMI_FromAdvanceLedger() calls the new read-only
+ *           scheduleEMI_FindActiveEmiConflicts_(ss) BEFORE routing to
+ *           Core/Web App. This runs client-side for BOTH pmo@ and
+ *           nazneen@ (it's just a read, no privileged write needed),
+ *           because this wrapper function always has a real `ui` —
+ *           it's invoked directly from the open spreadsheet's menu,
+ *           regardless of which user clicked it.
+ *        2. If conflicts are found, ONE combined ui.alert (Yes/No)
+ *           lists every conflicting employee together with the EMI
+ *           Reference Number of their existing active EMI, and asks
+ *           whether to schedule new EMIs for them anyway.
+ *        3. Yes → all conflicting employees are passed through as an
+ *           `allowExceptions` list. No → the list stays empty.
+ *        4. scheduleEMI_Core_(ss, allowExceptions) then SKIPS only the
+ *           employees who are still conflicting and NOT in the allow
+ *           list — every other eligible employee in the same run is
+ *           still scheduled normally. This replaces the old all-abort
+ *           behaviour with a per-employee skip.
+ *        5. scheduleEMI_BuildActiveEmiConflicts_() is the shared,
+ *           pure helper used by both the pre-check and Core, so the
+ *           definition of "conflict" can never drift between them.
+ *    - Core stays UI-free per the original design — the Yes/No dialog
+ *      lives only in the menu wrapper, never in Core or in 0_WebApp.gs.
+ *
  * ✅ Constants EMI_PMO_USER_, EMI_ALLOWED_USER_, EMI_WEBAPP_URL
  *    declared in 0_WebApp.gs — referenced here directly.
  *
@@ -97,6 +133,13 @@ function onOpen() {
  * pmo@butlerleather.com   → runs scheduleEMI_Core_(ss) directly
  * nazneen@butlerleather.com → routes to Web App
  * anyone else              → access denied
+ *
+ * ✅ NEW (v4): before routing, checks for employees who already have
+ * an active EMI. If any are found, asks ONE combined Yes/No question
+ * naming them all (with their existing active EMI Reference Number).
+ * This check + dialog run here because this function always has a
+ * real `ui` — it's invoked directly from the open spreadsheet's menu
+ * for BOTH users, unlike the Web App path further down which has none.
  */
 function scheduleEMI_FromAdvanceLedger() {
   const ui   = SpreadsheetApp.getUi();
@@ -108,10 +151,34 @@ function scheduleEMI_FromAdvanceLedger() {
     return;
   }
 
+  // ✅ NEW (v4) — read-only pre-check, safe for both users (no write yet)
+  let allowExceptions = [];
+  try {
+    const conflicts = scheduleEMI_FindActiveEmiConflicts_(ss);
+    if (conflicts.length > 0) {
+      const list = conflicts
+        .map(c => `  • ${c.empCode} – ${c.name} (Active EMI Ref: ${c.activeEmiRef})`)
+        .join("\n");
+      const resp = ui.alert(
+        "Employee(s) already have an active EMI",
+        `The following employee(s) already have an active EMI:\n\n${list}\n\n` +
+        `Schedule a new EMI for them anyway?`,
+        ui.ButtonSet.YES_NO
+      );
+      if (resp === ui.Button.YES) {
+        allowExceptions = conflicts.map(c => c.empCode);
+      }
+      // No → allowExceptions stays empty; those employees are skipped, not the whole run.
+    }
+  } catch (err) {
+    ui.alert("Error checking active EMI conflicts: " + err.message);
+    return;
+  }
+
   if (user === EMI_PMO_USER_) {
     // Owner: run core directly
     try {
-      const result = scheduleEMI_Core_(ss);
+      const result = scheduleEMI_Core_(ss, allowExceptions);
       ui.alert(result.message);
     } catch (err) {
       ui.alert("Error: " + err.message);
@@ -119,9 +186,9 @@ function scheduleEMI_FromAdvanceLedger() {
     return;
   }
 
-  // nazneen@: route via Web App
+  // nazneen@: route via Web App — allowExceptions travels in payload
   try {
-    const result = callEmiWebApp_("scheduleEMI", ss);
+    const result = callEmiWebApp_("scheduleEMI", ss, { allowExceptions });
     ui.alert(result.success
       ? (result.message || "EMI Schedule created ✅")
       : ("Error: " + (result.message || "Unknown error from Web App."))
@@ -198,7 +265,7 @@ function cancelEMI_ByReference() {
  * ================================================ */
 
 /**
- * scheduleEMI_Core_(ss)
+ * scheduleEMI_Core_(ss, allowExceptions)
  *
  * All scheduling logic. Receives ss (Spreadsheet object) — never
  * calls getActiveSpreadsheet() internally.
@@ -208,9 +275,21 @@ function cancelEMI_ByReference() {
  *   - Returns { success: false, message } with alert-friendly message if any row is invalid
  *   - On success: recreates single bulk protection on EMI_SCHEDULE A2:L{lastRow}
  *
+ * ✅ NEW (v4) — replaces the old v3 all-abort behaviour:
+ *   - allowExceptions (array of Employee Codes, default []) — employees who
+ *     were shown in the Yes/No dialog and explicitly approved for a new EMI
+ *     despite already having an active one.
+ *   - Any newly-eligible employee who already has an active EMI and is NOT
+ *     in allowExceptions is SKIPPED (not aborted) — every other eligible
+ *     employee in the same run is still scheduled normally.
+ *   - Conflict detection itself is delegated to the shared, pure helper
+ *     scheduleEMI_BuildActiveEmiConflicts_(), so this always agrees with
+ *     scheduleEMI_FindActiveEmiConflicts_() (used by the menu wrapper for
+ *     the pre-check dialog) on what counts as a conflict.
+ *
  * Returns: { success, message, refsCreated, rowsAdded }
  */
-function scheduleEMI_Core_(ss) {
+function scheduleEMI_Core_(ss, allowExceptions) {
 
   const ledger   = ss.getSheetByName(ADV_LEDGER_SHEET);
   const schedule = ss.getSheetByName(EMI_SCHEDULE_SHEET);
@@ -236,6 +315,10 @@ function scheduleEMI_Core_(ss) {
     status:      req_(ledMap, "STATUS"),
   };
 
+  // "EMI Status" is optional-mapped — it is a formula column (ARRAYFORMULA).
+  // Read via opt_() so missing header fails gracefully rather than throwing.
+  const emiStatusIdx0 = opt_(ledMap, "EMI STATUS");
+
   // Required schedule headers
   const S = {
     month:  req_(schMap, "MONTH"),
@@ -256,7 +339,7 @@ function scheduleEMI_Core_(ss) {
 
   const ledRange = ledger.getRange(2, 1, ledLast - 1, ledger.getLastColumn());
   const ledVals  = ledRange.getValues();        // numeric/date-safe
-  const ledDisp  = ledRange.getDisplayValues(); // formula-safe for Name/Dept
+  const ledDisp  = ledRange.getDisplayValues(); // formula-safe for Name/Dept/EMI Status
 
   // ---- Seed Current Balance formula only if EMI_SCHEDULE has no data rows ----
   seedCurrentBalanceFormulaIfFirstRun_(schedule, schMap);
@@ -264,8 +347,14 @@ function scheduleEMI_Core_(ss) {
   let nextRefNum = getNextEmiRefNumber_(ledger, L.ref);
   const nowStamp = stamp_();
 
+  // ✅ NEW (v4) — conflicts are SKIPPED (not aborted) unless explicitly allowed.
+  const conflicts = scheduleEMI_BuildActiveEmiConflicts_(ledVals, ledDisp, L, emiStatusIdx0);
+  const allowSet  = new Set((allowExceptions || []).map(String));
+  const skipSet   = new Set(conflicts.filter(c => !allowSet.has(c.empCode)).map(c => c.empCode));
+  const skippedActiveEmi = conflicts.filter(c => skipSet.has(c.empCode));
+
   // ✅ PHASE 1 — Validate ALL eligible rows FIRST before writing anything
-  // "Eligible" = has Employee Code + no existing ref
+  // "Eligible" = has Employee Code + no existing ref + not skipped for active-EMI conflict
   // Any eligible row that fails field validation = abort entire run
   for (let i = 0; i < ledVals.length; i++) {
     const row = ledVals[i];
@@ -275,6 +364,8 @@ function scheduleEMI_Core_(ss) {
 
     const existingRef = str_(row[L.ref]);
     if (existingRef) continue; // already scheduled — not eligible, skip silently
+
+    if (skipSet.has(empCode)) continue; // ✅ NEW (v4) — active-EMI conflict, not approved
 
     // ✅ This row IS eligible — validate all required fields strictly
     const advAmount    = num_(row[L.advAmt]);
@@ -307,6 +398,8 @@ function scheduleEMI_Core_(ss) {
 
     const existingRef = str_(row[L.ref]);
     if (existingRef) continue; // already scheduled
+
+    if (skipSet.has(empCode)) continue; // ✅ NEW (v4) — active-EMI conflict, not approved
 
     const advAmount    = num_(row[L.advAmt]);
     const tenure       = Math.floor(num_(row[L.tenure]));
@@ -363,10 +456,15 @@ function scheduleEMI_Core_(ss) {
     });
   }
 
+  // ✅ NEW (v4) — appended to whichever message is returned below, if anyone was skipped
+  const skippedNote = skippedActiveEmi.length > 0
+    ? `\n\nSkipped (already have an active EMI, not approved): ${skippedActiveEmi.map(c => `${c.empCode} – ${c.name}`).join(", ")}`
+    : "";
+
   if (ledgerUpdates.length === 0) {
     return {
       success: false,
-      message: "No new eligible advances found to schedule.\n(Required: Status=ACTIVE, Advance Amount, Advance Paid Month, EMI Start Month, Tenure)",
+      message: "No new eligible advances found to schedule.\n(Required: Status=ACTIVE, Advance Amount, Advance Paid Month, EMI Start Month, Tenure)" + skippedNote,
     };
   }
 
@@ -384,10 +482,89 @@ function scheduleEMI_Core_(ss) {
 
   return {
     success:     true,
-    message:     `EMI Schedule created ✅\nReferences created: ${ledgerUpdates.length}\nEMI rows added: ${scheduleRows.length}`,
+    message:     `EMI Schedule created ✅\nReferences created: ${ledgerUpdates.length}\nEMI rows added: ${scheduleRows.length}` + skippedNote,
     refsCreated: ledgerUpdates.length,
     rowsAdded:   scheduleRows.length,
   };
+}
+
+/**
+ * scheduleEMI_FindActiveEmiConflicts_(ss)
+ *
+ * ✅ NEW (v4) — Read-only pre-check. Safe to call directly from the
+ * client-side menu wrapper for BOTH pmo@ and nazneen@: it only reads
+ * the Advance Ledger, so it needs no privileged (owner) execution —
+ * unlike the actual scheduling write, which still goes through the
+ * Web App for nazneen@ exactly as before.
+ *
+ * Returns [{ empCode, name, activeEmiRef }, ...] for every employee
+ * who is newly-eligible for a new EMI (Employee Code present, no
+ * EMI Reference Number yet) but already has another row with
+ * EMI Status = "ACTIVE" elsewhere in the ledger.
+ */
+function scheduleEMI_FindActiveEmiConflicts_(ss) {
+  const ledger = ss.getSheetByName(ADV_LEDGER_SHEET);
+  if (!ledger) throw new Error(`Sheet not found: ${ADV_LEDGER_SHEET}`);
+
+  const ledMap = getHeaderMap_(ledger);
+  const L = {
+    emp:  req_(ledMap, "EMPLOYEE CODE"),
+    name: req_(ledMap, "NAME"),
+    ref:  req_(ledMap, "EMI REFERENCE NUMBER"),
+  };
+  const emiStatusIdx0 = opt_(ledMap, "EMI STATUS");
+
+  const ledLast = ledger.getLastRow();
+  if (ledLast < 2) return [];
+
+  const ledRange = ledger.getRange(2, 1, ledLast - 1, ledger.getLastColumn());
+  const ledVals  = ledRange.getValues();
+  const ledDisp  = ledRange.getDisplayValues();
+
+  return scheduleEMI_BuildActiveEmiConflicts_(ledVals, ledDisp, L, emiStatusIdx0);
+}
+
+/**
+ * scheduleEMI_BuildActiveEmiConflicts_(ledVals, ledDisp, L, emiStatusIdx0)
+ *
+ * ✅ NEW (v4) — Shared, pure helper used by BOTH
+ * scheduleEMI_FindActiveEmiConflicts_() (client-side pre-check, for the
+ * Yes/No dialog) and scheduleEMI_Core_() (the actual write), so the two
+ * can never disagree on what counts as a conflict. Takes already-read
+ * ledger data — no sheet access here.
+ *
+ * Returns [{ empCode, name, activeEmiRef }, ...].
+ */
+function scheduleEMI_BuildActiveEmiConflicts_(ledVals, ledDisp, L, emiStatusIdx0) {
+  const activeEmiRefByEmp = new Map(); // empCode -> ref of their ACTIVE EMI row
+
+  if (emiStatusIdx0 !== -1) {
+    for (let i = 0; i < ledDisp.length; i++) {
+      const empCode   = str_(ledVals[i][L.emp]);
+      const emiStatus = str_(ledDisp[i][emiStatusIdx0]).toUpperCase();
+      if (empCode && emiStatus === "ACTIVE") {
+        activeEmiRefByEmp.set(empCode, str_(ledVals[i][L.ref]) || "(no ref)");
+      }
+    }
+  }
+
+  const conflicts = [];
+  for (let i = 0; i < ledVals.length; i++) {
+    const empCode = str_(ledVals[i][L.emp]);
+    if (!empCode) continue;
+
+    const existingRef = str_(ledVals[i][L.ref]);
+    if (existingRef) continue; // already scheduled — not a new row
+
+    if (activeEmiRefByEmp.has(empCode)) {
+      const name = str_(ledDisp[i][L.name]) || empCode;
+      // Avoid duplicate entries if same employee appears more than once as a new row
+      if (!conflicts.some(c => c.empCode === empCode)) {
+        conflicts.push({ empCode, name, activeEmiRef: activeEmiRefByEmp.get(empCode) });
+      }
+    }
+  }
+  return conflicts;
 }
 
 /**

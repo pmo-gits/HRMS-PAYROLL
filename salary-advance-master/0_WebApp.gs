@@ -80,14 +80,20 @@ function doPost(e) {
  *   - ss passed in (no getActiveSpreadsheet)
  *   - bypassTabGuard not needed here (no sheet-level guard)
  *   - requestedBy available if stamping is ever needed
+ *
+ * ✅ NEW (v4): payload.allowExceptions (array of Employee Codes) is passed
+ * through unchanged to scheduleEMI_Core_(). The Yes/No decision behind
+ * this list was already made client-side in the menu wrapper — this
+ * handler stays UI-free, it only relays the decision.
  */
 function scheduleEMIServer_(payload) {
   try {
     const ssId = String(payload.spreadsheetId || "").trim();
     if (!ssId) return emiJsonResponse_(false, "Missing spreadsheetId.");
 
-    const ss     = SpreadsheetApp.openById(ssId);
-    const result = scheduleEMI_Core_(ss);
+    const ss              = SpreadsheetApp.openById(ssId);
+    const allowExceptions = Array.isArray(payload.allowExceptions) ? payload.allowExceptions : [];
+    const result          = scheduleEMI_Core_(ss, allowExceptions);
 
     return emiJsonResponse_(result.success, result.message, {
       refsCreated: result.refsCreated || 0,

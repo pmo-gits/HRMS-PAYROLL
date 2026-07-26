@@ -119,8 +119,8 @@ function syncNewEmployeesAppendOnly_Runner_(sheet, newRows, year, monthIndex0, d
   // Append A:H in Attendance entry
   sheet.getRange(appendStartRow, 1, newRows.length, STATIC_COLS_COUNT).setValues(newRows);
 
-  // Apply dropdowns for appended rows (I:AM)
-  applyAttendanceDropdownValidation_(sheet, appendStartRow, newRows.length);
+  // Apply dropdowns for appended rows (I:AM), excluding Sundays
+  applyAttendanceDropdownValidation_(sheet, appendStartRow, newRows.length, year, monthIndex0, daysInMonth);
 
   // Fill WO in Sundays for appended rows only
   fillWOSundaysForRows_(sheet, year, monthIndex0, daysInMonth, appendStartRow, newRows.length);
