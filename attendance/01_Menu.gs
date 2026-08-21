@@ -24,4 +24,9 @@ function onOpen() {
     .addSeparator()
     .addItem("Refresh Salary Advance EMI", "refreshSalaryAdvanceEMI_Button")
     .addToUi();
+
+  // ✅ Help — see 14_FixAuth.gs
+  ui.createMenu("Help")
+    .addItem("Fix Permissions (Re-authorize)", "resetMyAttendanceAuthorization")
+    .addToUi();
 }

@@ -31,9 +31,18 @@ function onOpen() {
   ui.createMenu('Payroll-Admin')
     .addItem('Validate Payroll', 'validatePayroll')
     .addSeparator()
+    .addItem('Update Salary Advance Recovered Amount', 'updateSalaryAdvanceRecoveredAmount')
+    .addSeparator()
     .addItem('Generate Locked Payroll', 'generateLockedPayroll')
     .addSeparator()
     .addItem('Generate Bank Transfer File', 'generateBankTransferFile')
     .addSeparator()
+    .addToUi();
+
+  // -----------------------------
+  // Help Menu — see 11.FixPermissions.gs
+  // -----------------------------
+  ui.createMenu('Help')
+    .addItem('Fix Permissions (Re-authorize)', 'resetMyPayrollAuthorization')
     .addToUi();
 }

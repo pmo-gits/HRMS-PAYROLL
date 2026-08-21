@@ -23,5 +23,7 @@ function onOpen() {
   ui.createMenu('Payslip Email')
     .addItem('Get Staff Emails', 'getStaffEmails')
     .addItem('Send Staff Payslip Emails', 'sendStaffPayslipEmails')
+    .addSeparator()
+    .addItem('Fix Permissions (Re-authorize)', 'resetMyPayslipAuthorization')
     .addToUi();
 }
