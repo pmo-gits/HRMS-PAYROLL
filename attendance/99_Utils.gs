@@ -458,10 +458,21 @@ function clearSalaryAdvanceDeductionsInputsByHeader_(sh, startRow, endRow) {
     'PAYROLL STATUS',
     'RECOVERED AMOUNT',
     'SA RUN TIMESTAMP', // ✅ clears row 2 on month refresh; header in row 1 preserved
+    'SETTLEMENT STAGE', // ✅ carried down from Master EMI_SCHEDULE by 13_SalaryAdvance.gs
+    'LAST WORKING DAY',
   ];
 
   const numRows = Math.max(endRow - startRow + 1, 0);
   if (numRows <= 0) return;
+
+  // The two settlement columns are protected by applySettlementColumns_(). Drop those
+  // protections first or the clear below fails for anyone who is not the file owner.
+  sh.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => {
+    const desc = p.getDescription() || '';
+    if (desc.startsWith(SETTLEMENT_PROTECTION_PREFIX)) {
+      try { p.remove(); } catch (e) {}
+    }
+  });
 
   targets.forEach(t => {
     const idx = headers.indexOf(t);

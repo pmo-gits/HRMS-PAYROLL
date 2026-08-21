@@ -106,6 +106,8 @@ function doPost(e) {
       result = validateAttendanceServer_(payload);
     } else if (action === 'validatePayroll') {
       result = validatePayrollServer_(payload);
+    } else if (action === 'updateSalaryAdvanceRecoveredAmount') {
+      result = updateSalaryAdvanceRecoveredAmountServer_(payload);
     } else if (action === 'generateBankTransferFile') {
       result = generateBankTransferFileServer_(payload);
     } else if (action === 'generatePayslips') {
@@ -239,19 +241,30 @@ function generateLockedPayrollServer_(payload) {
       return { success: false, message: `Attendance tab not found: ${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS}` };
     }
 
+    // The Salary Advance Approval tab lives in THIS workings file, not the
+    // attendance file. It is the source of truth for Planned EMI and the
+    // effective HR Decision from here on — the attendance tab still holds
+    // HR's original, untouched figures until the write further down.
+    const approvalSh = ss.getSheetByName(CONST.TABS.SALARY_ADVANCE_APPROVAL);
+    if (!approvalSh) {
+      return { success: false, message: `Tab not found: ${CONST.TABS.SALARY_ADVANCE_APPROVAL}` };
+    }
+
     glpAssertAttendanceEntryLocked_(attendanceEntrySh);
     glpAssertSalaryAdvancePayrollNotLocked_(salaryAdvanceSh);
 
     try {
-      glpAssertAdvanceDeductionTotalMatchesPlannedEmi_(meta, salaryAdvanceSh);
-      glpAssertHrDecisionConsistentPerEmployee_(salaryAdvanceSh);     // ── NEW PRECHECK, non-negotiable ──
+      glpAssertSalaryAdvanceApproved_(approvalSh, monthLabel);        // ── NEW ──
+      glpAssertRecoveryWithinMaxRecoverable_(approvalSh);             // ── NEW ──
+      glpAssertAdvanceDeductionTotalMatchesPlannedEmi_(meta, approvalSh);
+      glpAssertHrDecisionConsistentPerEmployee_(approvalSh);          // ── non-negotiable ──
       glpAssertNegativeBalanceEmployeesCleared_(meta);
       glpAssertMetaGrossTotalPayrollMatchesSalaryMaster_(meta);
     } catch (err) {
       return { success: false, message: err.message };
     }
 
-    const preparedAttendanceUpdate = glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, nowText);
+    const preparedAttendanceUpdate = glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, approvalSh, nowText);
     const preparedPayrollControlUpdate = glpPreparePayrollControlCenterUpdatePayload_({
       monthLabel: monthLabel,
       attendanceFileId: attendanceFileId,
@@ -295,7 +308,7 @@ function generateLockedPayrollServer_(payload) {
       glpApplySalaryAdvanceUpdatePayload_(salaryAdvanceSh, preparedAttendanceUpdate);
       SpreadsheetApp.flush();
 
-      glpPushRecoveredLedgerSnapshot_(attendanceSS);
+      glpPushRecoveredLedgerSnapshot_(attendanceSS, ss);
       glpPushLeaveLedgerSnapshotAndUpdateBalances_(attendanceSS);
       SpreadsheetApp.flush();
 
@@ -393,18 +406,173 @@ function glpAssertSalaryAdvancePayrollNotLocked_(salaryAdvanceSh) {
   }
 }
 
-function glpAssertAdvanceDeductionTotalMatchesPlannedEmi_(metaSh, salaryAdvanceSh) {
-  const metaTotal = glpGetMetaCheckValue_(metaSh, 'Advance Deduction Total', 'Payroll Status');
-  const attendanceTotal = glpGetSalaryAdvancePlannedEmiTotal_(salaryAdvanceSh);
+/* Compares META_DATA's live "Advance Deduction Total"
+   ( =IF(B2="","", sum(PAY_ROLL!AR1:AR)) ) against the APPROVAL tab's
+   Planned EMI total.
 
-  const metaNum = glpToNumber_(metaTotal);
-  const attendanceNum = glpToNumber_(attendanceTotal);
+   Repointed from the attendance tab deliberately. "Update Salary Advance
+   Recovered Amount" writes PAY_ROLL!Advance Deduction and nothing else, so
+   the attendance tab still holds HR's original provisional figures at this
+   point and comparing against it would fail every single lock.
 
-  if (Math.abs(metaNum - attendanceNum) > 0.0001) {
+   Because META recalculates from the very column the Update button writes,
+   this assert doubles as proof that the button ran AND wrote the right
+   total — no separate check is needed for that. */
+function glpAssertAdvanceDeductionTotalMatchesPlannedEmi_(metaSh, approvalSh) {
+  const metaTotal    = glpGetMetaCheckValue_(metaSh, 'Advance Deduction Total', 'Payroll Status');
+  const approvalTotal = glpGetSalaryAdvancePlannedEmiTotal_(approvalSh);
+
+  const metaNum     = glpToNumber_(metaTotal);
+  const approvalNum = glpToNumber_(approvalTotal);
+
+  if (Math.abs(metaNum - approvalNum) > 0.0001) {
     throw new Error(
       `Advance Deduction Total mismatch. META_DATA = ${metaNum}, ` +
-      `Salary Advance deductions Planned EMI total = ${attendanceNum}. ` +
-      `Lock process stopped.`
+      `${CONST.TABS.SALARY_ADVANCE_APPROVAL} Planned EMI total = ${approvalNum}. ` +
+      `Re-run "Update Salary Advance Recovered Amount". Lock process stopped.`
+    );
+  }
+}
+
+/* =========================================================
+   NEW PRECHECK: THE APPROVAL MUST HAVE BEEN COMMITTED
+   FOR THIS MONTH
+   — "Updated On" is stamped only by "Update Salary Advance
+   Recovered Amount", and cleared by every Validate Payroll
+   refresh. So a present, current-month stamp means the admin's
+   figures were committed and nothing has been refreshed since.
+
+   The month is part of the stamp on purpose: the approval tab
+   ships inside the payroll workings TEMPLATE, and every month's
+   file is a Drive copy of it. A stamp accidentally left in the
+   template would otherwise make every future month look
+   pre-approved.
+========================================================= */
+
+function glpAssertSalaryAdvanceApproved_(approvalSh, monthLabel) {
+  const lastRow = approvalSh.getLastRow();
+  const lastCol = approvalSh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return; // no EMI rows this month → nothing to approve
+
+  const headers = approvalSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const empIdx0   = glpRequireHeaderIndex_(idx, 'Employee Code', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const refIdx0   = glpRequireHeaderIndex_(idx, 'EMI Reference Number', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const stampIdx0 = glpRequireHeaderIndex_(idx, 'Updated On', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+
+  const values = approvalSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+
+  const wantedMonth = String(monthLabel || '').trim().toUpperCase();
+  const unstamped = [];
+  const wrongMonth = [];
+  let emiRows = 0;
+
+  for (let i = 0; i < values.length; i++) {
+    const empCode = String(values[i][empIdx0] || '').trim();
+    const ref     = String(values[i][refIdx0] || '').trim();
+    if (!empCode || !ref) continue;
+
+    emiRows++;
+    const stamp = String(values[i][stampIdx0] || '').trim();
+
+    if (!stamp) {
+      unstamped.push(`${empCode} · ${ref}`);
+      continue;
+    }
+
+    const stampMonth = String(stamp.split('|')[0] || '').trim().toUpperCase();
+    if (stampMonth !== wantedMonth) {
+      wrongMonth.push(`${empCode} · ${ref} → "${stampMonth || '(none)'}"`);
+    }
+  }
+
+  if (!emiRows) return; // genuinely nothing to approve this month
+
+  if (unstamped.length) {
+    throw new Error(
+      `Salary advance recovery has not been approved for ${monthLabel}. ` +
+      `Run "Update Salary Advance Recovered Amount" before locking. ` +
+      `${unstamped.length} unapproved row(s), e.g. ${unstamped.slice(0, 5).join(', ')}.`
+    );
+  }
+
+  if (wrongMonth.length) {
+    throw new Error(
+      `Salary advance approval belongs to a different month. Expected "${monthLabel}". ` +
+      `Run "Validate Payroll", then "Update Salary Advance Recovered Amount". ` +
+      `${wrongMonth.slice(0, 5).join(' | ')}`
+    );
+  }
+}
+
+/* =========================================================
+   NEW PRECHECK: RECOVERY MUST FIT WITHIN AVAILABLE PAY
+   — The Update button already refuses on an ERROR alert, and
+   the entry cell carries data validation. Both are bypassable
+   by paste, so this is the authoritative backstop.
+
+   ABSCOND and settlement-month rows are exempt: their amount is
+   system-computed and already clamped to Max Recoverable, so
+   they can never exceed it by construction.
+========================================================= */
+
+function glpAssertRecoveryWithinMaxRecoverable_(approvalSh) {
+  const lastRow = approvalSh.getLastRow();
+  const lastCol = approvalSh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return;
+
+  const headers = approvalSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const empIdx0     = glpRequireHeaderIndex_(idx, 'Employee Code', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const nameIdx0    = glpRequireHeaderIndex_(idx, 'Name', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const refIdx0     = glpRequireHeaderIndex_(idx, 'EMI Reference Number', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const plannedIdx0 = glpRequireHeaderIndex_(idx, 'Planned EMI', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const maxIdx0     = glpRequireHeaderIndex_(idx, 'Max Recoverable', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const entryIdx0   = glpRequireHeaderIndex_(idx, 'Admin Entry', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+
+  const values = approvalSh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  const byEmp = new Map(); // empCode -> { name, planned, max, hasEntry }
+
+  for (let i = 0; i < values.length; i++) {
+    const empCode = String(values[i][empIdx0] || '').trim();
+    const ref     = String(values[i][refIdx0] || '').trim();
+    if (!empCode || !ref) continue;
+
+    if (!byEmp.has(empCode)) {
+      byEmp.set(empCode, {
+        name: String(values[i][nameIdx0] || '').trim(),
+        planned: 0,
+        max: glpToNumber_(values[i][maxIdx0]),
+        hasEntry: false,
+      });
+    }
+
+    const info = byEmp.get(empCode);
+    info.planned += glpToNumber_(values[i][plannedIdx0]);
+
+    const entry = values[i][entryIdx0];
+    if (entry !== '' && entry != null) info.hasEntry = true;
+  }
+
+  const over = [];
+  byEmp.forEach((info, empCode) => {
+    if (!info.hasEntry) return;                       // system-computed → already clamped
+    if (info.planned - info.max > 0.0001) {
+      over.push(
+        `${info.name} (${empCode}): entered ${info.planned}, ` +
+        `available ${info.max}, over by ${info.planned - info.max}`
+      );
+    }
+  });
+
+  if (over.length) {
+    throw new Error(
+      `Salary advance recovery exceeds available pay for ${over.length} employee(s). ` +
+      `Lower the Admin Entry on "${CONST.TABS.SALARY_ADVANCE_APPROVAL}" and re-run ` +
+      `"Update Salary Advance Recovered Amount": ${over.join(' | ')}`
     );
   }
 }
@@ -440,20 +608,23 @@ function glpAssertNegativeBalanceEmployeesCleared_(metaSh) {
    for a mismatch to be bypassed.
 ========================================================= */
 
-function glpAssertHrDecisionConsistentPerEmployee_(salaryAdvanceSh) {
-  const lastRow = salaryAdvanceSh.getLastRow();
-  const lastCol = salaryAdvanceSh.getLastColumn();
+function glpAssertHrDecisionConsistentPerEmployee_(approvalSh) {
+  const lastRow = approvalSh.getLastRow();
+  const lastCol = approvalSh.getLastColumn();
   if (lastRow < 2 || lastCol < 1) return;
 
-  const headers = salaryAdvanceSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const headers = approvalSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
   const idx = buildHeaderIndex_(headers);
 
-  const empIdx0  = glpRequireHeaderIndex_(idx, 'Employee Code', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
-  const nameIdx0 = glpRequireHeaderIndex_(idx, 'Name', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
-  const refIdx0  = glpRequireHeaderIndex_(idx, 'EMI Reference Number', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
-  const hrIdx0   = glpRequireHeaderIndex_(idx, 'HR Decision', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const empIdx0  = glpRequireHeaderIndex_(idx, 'Employee Code', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const nameIdx0 = glpRequireHeaderIndex_(idx, 'Name', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const refIdx0  = glpRequireHeaderIndex_(idx, 'EMI Reference Number', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  // Reads the EFFECTIVE decision — HR's fact where there is one, the admin's
+  // call otherwise — not HR's raw column, so an approved or refused SKIP is
+  // judged on what will actually happen.
+  const hrIdx0   = glpRequireHeaderIndex_(idx, 'Effective Decision', CONST.TABS.SALARY_ADVANCE_APPROVAL);
 
-  const values = salaryAdvanceSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
+  const values = approvalSh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
 
   const byEmp = new Map(); // empCode -> { name, rows: [{ ref, decision }] }
 
@@ -464,7 +635,12 @@ function glpAssertHrDecisionConsistentPerEmployee_(salaryAdvanceSh) {
     const ref = String(values[i][refIdx0] || '').trim();
     if (!ref) continue;
 
-    const decision = String(values[i][hrIdx0] || '').trim().toUpperCase();
+    // PAY EXTRA / PAY LESS are amount instructions, not decisions about the employee, and
+    // Alert requires them on the OLDEST advance only — so they legitimately appear on one
+    // row and not the others. Comparing them here would block every multi-advance employee
+    // the moment an amount was entered. Departure and SKIP decisions still must agree.
+    const raw = String(values[i][hrIdx0] || '').trim().toUpperCase();
+    const decision = (raw === 'PAY EXTRA' || raw === 'PAY LESS') ? '' : raw;
     const name = String(values[i][nameIdx0] || '').trim();
 
     if (!byEmp.has(empCode)) byEmp.set(empCode, { name: name, rows: [] });
@@ -490,8 +666,8 @@ function glpAssertHrDecisionConsistentPerEmployee_(salaryAdvanceSh) {
   if (mismatches.length) {
     throw new Error(
       `HR Decision mismatch across EMI rows for the same employee. ` +
-      `All EMI rows for one employee must carry the same HR Decision this month. ` +
-      `Fix in "${CONST.TABS.SALARY_ADVANCE_DEDUCTIONS}" before locking: ${mismatches.join(' | ')}`
+      `All EMI rows for one employee must carry the same decision this month. ` +
+      `Fix in "${CONST.TABS.SALARY_ADVANCE_APPROVAL}" before locking: ${mismatches.join(' | ')}`
     );
   }
 }
@@ -563,16 +739,17 @@ function glpMapMetaRowByHeaders_(headers, rowValues) {
   return out;
 }
 
-function glpGetSalaryAdvancePlannedEmiTotal_(salaryAdvanceSh) {
-  const lastRow = salaryAdvanceSh.getLastRow();
-  const lastCol = salaryAdvanceSh.getLastColumn();
+/* Now reads the APPROVAL tab, not the attendance deductions tab. */
+function glpGetSalaryAdvancePlannedEmiTotal_(approvalSh) {
+  const lastRow = approvalSh.getLastRow();
+  const lastCol = approvalSh.getLastColumn();
   if (lastRow < 2 || lastCol < 1) return 0;
 
-  const headers = salaryAdvanceSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const headers = approvalSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
   const idx = buildHeaderIndex_(headers);
-  const plannedEmiCol = glpRequireHeaderIndex_(idx, 'Planned EMI', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS) + 1;
+  const plannedEmiCol = glpRequireHeaderIndex_(idx, 'Planned EMI', CONST.TABS.SALARY_ADVANCE_APPROVAL) + 1;
 
-  const values = salaryAdvanceSh.getRange(2, plannedEmiCol, lastRow - 1, 1).getDisplayValues();
+  const values = approvalSh.getRange(2, plannedEmiCol, lastRow - 1, 1).getDisplayValues();
   let total = 0;
 
   for (let i = 0; i < values.length; i++) {
@@ -598,7 +775,7 @@ function glpToNumber_(value) {
    else in this block (apply/rollback) is unchanged.
 ========================================================= */
 
-function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, lockedOnText) {
+function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, approvalSh, lockedOnText) {
   const payLastRow = payrollSh.getLastRow();
   const payLastCol = payrollSh.getLastColumn();
   const saLastRow = salaryAdvanceSh.getLastRow();
@@ -618,9 +795,11 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
   const payCapacityIdx0 = glpRequireHeaderIndex_(payIdx, 'Advance Recovery Capacity', CONST.TEMPLATES.PAYROLL_TAB_NAME);
 
   const saEmpIdx0 = glpRequireHeaderIndex_(saIdx, CONST.KEYS.ATTENDANCE_TABS[CONST.TABS.SALARY_ADVANCE_DEDUCTIONS], CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const saRefIdx0 = glpRequireHeaderIndex_(saIdx, 'EMI Reference Number', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
   const saRecoveredIdx0 = glpRequireHeaderIndex_(saIdx, 'Recovered Amount', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
   const saPayrollStatusIdx0 = glpRequireHeaderIndex_(saIdx, 'Payroll Status', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
   const saPlannedEmiIdx0 = glpRequireHeaderIndex_(saIdx, 'Planned EMI', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+  const saHrDecisionIdx0 = glpRequireHeaderIndex_(saIdx, 'HR Decision', CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
 
   const payrollData = payrollSh.getRange(2, 1, payLastRow - 1, payLastCol).getDisplayValues();
   const salaryAdvanceData = saLastRow >= 2
@@ -641,13 +820,16 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
     };
   }
 
-  // NOTE: payAdvIdx0 (PAY_ROLL "Advance Deduction") is looked up above only to
-  // fail fast if that header is ever missing. Its per-row value is intentionally
-  // NOT used below — Recovered Amount is sourced per-row from this same sheet's
-  // own "Planned EMI" column (see loop below), capped at each employee's real
-  // affordability via PAY_ROLL's "Advance Recovery Capacity" column, consumed
-  // sequentially in existing sheet row order across an employee's multiple EMI
-  // rows (first row draws down capacity first, remainder rolls to the next row).
+  // ---- Approved figures, keyed employee||ref ----
+  // Planned EMI and the effective decision come from the APPROVAL tab, which is
+  // the source of truth from the moment "Update Salary Advance Recovered Amount"
+  // runs. The attendance tab still holds HR's original provisional values and is
+  // only written at the very end of this lock.
+  const approved = glpBuildApprovedByRef_(approvalSh);
+
+  // Capacity remains a no-op backstop: the approved amount is already clamped to
+  // Max Recoverable upstream, so Advance Deduction never exceeds it. Kept because
+  // it costs nothing and catches any path we did not foresee.
   const empCapacityByCode = new Map();
   for (let i = 0; i < payrollData.length; i++) {
     const empCode = String(payrollData[i][payEmpIdx0] || '').trim();
@@ -655,48 +837,127 @@ function glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, locke
     empCapacityByCode.set(empCode, glpToNumber_(payrollData[i][payCapacityIdx0]));
   }
 
-  const recoveredValues          = [];
-  const payrollStatusValues      = [];
-  const originalRecoveredValues  = [];
+  // ---- Draw capacity down OLDEST ADVANCE FIRST ----
+  // Previously this consumed capacity in physical sheet row order, so which loan
+  // absorbed a shortfall depended on where its row happened to sit. EMI reference
+  // numbers are issued as max+1, so a lower number is always the older advance.
+  // The sort must be NUMERIC on the captured digits — lexically "EMI-10" sorts
+  // before "EMI-2", which would recover the wrong loan first. Rows whose ref does
+  // not match the pattern sort last, preserving their relative order.
+  const order = salaryAdvanceData.map((row, i) => ({
+    i,
+    emp: String(row[saEmpIdx0] || '').trim(),
+    refNum: glpRefNumber_(row[saRefIdx0]),
+  }));
+  order.sort((a, b) => (a.refNum - b.refNum) || (a.i - b.i));
+
+  const recoveredValues             = new Array(salaryAdvanceData.length);
+  const payrollStatusValues         = new Array(salaryAdvanceData.length);
+  const plannedEmiValues            = new Array(salaryAdvanceData.length);
+  const hrDecisionValues            = new Array(salaryAdvanceData.length);
+  const originalRecoveredValues     = [];
   const originalPayrollStatusValues = [];
+  const originalPlannedEmiValues    = [];
+  const originalHrDecisionValues    = [];
 
   for (let i = 0; i < salaryAdvanceData.length; i++) {
-    const empCode            = String(salaryAdvanceData[i][saEmpIdx0] || '').trim();
-    const existingRecovered  = salaryAdvanceData[i][saRecoveredIdx0];
-    const existingPayrollStatus = salaryAdvanceData[i][saPayrollStatusIdx0];
+    originalRecoveredValues.push([salaryAdvanceData[i][saRecoveredIdx0]]);
+    originalPayrollStatusValues.push([salaryAdvanceData[i][saPayrollStatusIdx0]]);
+    originalPlannedEmiValues.push([salaryAdvanceData[i][saPlannedEmiIdx0]]);
+    originalHrDecisionValues.push([salaryAdvanceData[i][saHrDecisionIdx0]]);
+  }
 
-    originalRecoveredValues.push([existingRecovered]);
-    originalPayrollStatusValues.push([existingPayrollStatus]);
+  for (let k = 0; k < order.length; k++) {
+    const i = order[k].i;
+    const empCode = order[k].emp;
 
     if (!empCode) {
-      recoveredValues.push(['']);
-      payrollStatusValues.push(['']);
+      recoveredValues[i]     = [''];
+      payrollStatusValues[i] = [''];
+      plannedEmiValues[i]    = [salaryAdvanceData[i][saPlannedEmiIdx0]];
+      hrDecisionValues[i]    = [salaryAdvanceData[i][saHrDecisionIdx0]];
       continue;
     }
 
+    const ref = String(salaryAdvanceData[i][saRefIdx0] || '').trim();
+    const app = approved[empCode.toUpperCase() + '||' + ref.toUpperCase()] || null;
+
+    // Approved figures win; fall back to the sheet's own values if a row somehow
+    // has no approval counterpart, so a stray row can never blank the record.
+    const plannedEmi = app ? app.planned  : glpToNumber_(salaryAdvanceData[i][saPlannedEmiIdx0]);
+
+    // The full Effective Decision is written back, including PAY EXTRA and PAY LESS. That
+    // column's dropdown lists only the three HR values, so the write clears the validation
+    // first — see glpApplySalaryAdvanceUpdatePayload_.
+    const decision   = app ? app.decision : salaryAdvanceData[i][saHrDecisionIdx0];
+
+    plannedEmiValues[i] = [plannedEmi];
+    hrDecisionValues[i] = [decision];
+
     if (empCapacityByCode.has(empCode)) {
-      const plannedEmi = glpToNumber_(salaryAdvanceData[i][saPlannedEmiIdx0]);
       const remainingCapacity = empCapacityByCode.get(empCode);
-      const thisRowRecovered = Math.min(plannedEmi, remainingCapacity);
+      const thisRowRecovered  = Math.min(plannedEmi, remainingCapacity);
       empCapacityByCode.set(empCode, remainingCapacity - thisRowRecovered);
-      recoveredValues.push([thisRowRecovered]);
+      recoveredValues[i] = [thisRowRecovered];
     } else {
-      recoveredValues.push(['']);
+      recoveredValues[i] = [''];
     }
 
-    payrollStatusValues.push([CONST.VALUES.LOCK_STATUS_LOCKED]);
+    payrollStatusValues[i] = [CONST.VALUES.LOCK_STATUS_LOCKED];
   }
 
   return {
     noEmployeeCodeMode: false,
     recoveredColumn: saRecoveredIdx0 + 1,
     payrollStatusColumn: saPayrollStatusIdx0 + 1,
+    plannedEmiColumn: saPlannedEmiIdx0 + 1,
+    hrDecisionColumn: saHrDecisionIdx0 + 1,
     recoveredValues,
     payrollStatusValues,
+    plannedEmiValues,
+    hrDecisionValues,
     originalRecoveredValues,
     originalPayrollStatusValues,
+    originalPlannedEmiValues,
+    originalHrDecisionValues,
     rowCount: salaryAdvanceData.length,
   };
+}
+
+/* Approved Planned EMI + effective decision, keyed "EMP||REF". */
+function glpBuildApprovedByRef_(approvalSh) {
+  const map = {};
+  const lastRow = approvalSh.getLastRow();
+  const lastCol = approvalSh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return map;
+
+  const headers = approvalSh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const idx = buildHeaderIndex_(headers);
+
+  const empIdx0     = glpRequireHeaderIndex_(idx, 'Employee Code', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const refIdx0     = glpRequireHeaderIndex_(idx, 'EMI Reference Number', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const plannedIdx0 = glpRequireHeaderIndex_(idx, 'Planned EMI', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+  const decIdx0     = glpRequireHeaderIndex_(idx, 'Effective Decision', CONST.TABS.SALARY_ADVANCE_APPROVAL);
+
+  const values = approvalSh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  for (let i = 0; i < values.length; i++) {
+    const empCode = String(values[i][empIdx0] || '').trim();
+    const ref     = String(values[i][refIdx0] || '').trim();
+    if (!empCode || !ref) continue;
+
+    map[empCode.toUpperCase() + '||' + ref.toUpperCase()] = {
+      planned:  glpToNumber_(values[i][plannedIdx0]),
+      decision: String(values[i][decIdx0] || '').trim(),
+    };
+  }
+  return map;
+}
+
+/* Numeric part of "EMI-12". Non-matching refs sort last. */
+function glpRefNumber_(ref) {
+  const m = String(ref == null ? '' : ref).match(/(\d+)/);
+  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
 }
 
 function glpApplySalaryAdvanceUpdatePayload_(salaryAdvanceSh, payload) {
@@ -707,8 +968,28 @@ function glpApplySalaryAdvanceUpdatePayload_(salaryAdvanceSh, payload) {
     return;
   }
 
+  // This is the ONLY write into the attendance file in the whole flow, which is
+  // what keeps ATTENDANCE_VALIDATION untouched between Validate Attendance and
+  // the lock. Four columns now, not two: the approved Planned EMI and decision
+  // are frozen in alongside the recovery result.
+  //
+  // Planned EMI is written from row 2 down, which replaces that column's
+  // ARRAYFORMULA cleanly — row 2 is its anchor. A locked audit artefact holding
+  // values rather than a live formula is the better end state.
   salaryAdvanceSh.getRange(2, payload.recoveredColumn, payload.rowCount, 1).setValues(payload.recoveredValues);
   salaryAdvanceSh.getRange(2, payload.payrollStatusColumn, payload.rowCount, 1).setValues(payload.payrollStatusValues);
+  salaryAdvanceSh.getRange(2, payload.plannedEmiColumn, payload.rowCount, 1).setValues(payload.plannedEmiValues);
+
+  // HR Decision's dropdown offers only SKIP / RESIGNED / ABSCOND, but the effective decision
+  // can also be PAY EXTRA or PAY LESS, which the validation would reject outright. Clear the
+  // rule before writing, the same way Sunday "WO" is planted in the Attendance entry tab.
+  //
+  // Dropping the validation is safe here and only here: this is the last write into the
+  // attendance file, and the whole file is protected immediately afterwards. Nobody types in
+  // this column again — from this point it is a locked record, not an input.
+  const hrDecisionRange = salaryAdvanceSh.getRange(2, payload.hrDecisionColumn, payload.rowCount, 1);
+  hrDecisionRange.setDataValidation(null);
+  hrDecisionRange.setValues(payload.hrDecisionValues);
 }
 
 function glpRollbackSalaryAdvanceUpdatePayload_(salaryAdvanceSh, payload) {
@@ -719,8 +1000,20 @@ function glpRollbackSalaryAdvanceUpdatePayload_(salaryAdvanceSh, payload) {
     return;
   }
 
+  // Restores all four columns. Planned EMI comes back as the VALUES it held
+  // before the write — the original ARRAYFORMULA is not restored, because the
+  // rollback path only fires when a later step threw and the month is going to
+  // be re-run from Validate Payroll anyway.
   salaryAdvanceSh.getRange(2, payload.recoveredColumn, payload.rowCount, 1).setValues(payload.originalRecoveredValues);
   salaryAdvanceSh.getRange(2, payload.payrollStatusColumn, payload.rowCount, 1).setValues(payload.originalPayrollStatusValues);
+  salaryAdvanceSh.getRange(2, payload.plannedEmiColumn, payload.rowCount, 1).setValues(payload.originalPlannedEmiValues);
+
+  // Validation was cleared on the way in and is not restored — the rollback path only runs
+  // when a later step threw, and the month is re-run from Validate Payroll anyway. Clearing
+  // it also guarantees the restore itself cannot be rejected.
+  const hrDecisionRange = salaryAdvanceSh.getRange(2, payload.hrDecisionColumn, payload.rowCount, 1);
+  hrDecisionRange.setDataValidation(null);
+  hrDecisionRange.setValues(payload.originalHrDecisionValues);
 }
 
 /* =========================================================

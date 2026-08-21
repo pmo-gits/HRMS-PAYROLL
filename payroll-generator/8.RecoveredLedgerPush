@@ -1,4 +1,14 @@
-function glpPushRecoveredLedgerSnapshot_(attendanceSS) {
+/**
+ * @param {Spreadsheet} attendanceSS  the month's attendance file
+ * @param {Spreadsheet} workingsSS    the payroll workings file, for the approval tab
+ *
+ * "Close In Months" is read from the approval tab rather than the attendance tab: it is an
+ * admin decision, not something HR records, and routing it through the attendance file would
+ * put an admin-only field in HR's space. It travels to the ledger so that
+ * 3A_Master_SharedEMILockSync can act on it — reshaping the schedule is the master's job, and
+ * the plan must only exist once the payroll is actually locked.
+ */
+function glpPushRecoveredLedgerSnapshot_(attendanceSS, workingsSS) {
   const attendanceFileName = attendanceSS.getName();
   const sheetName = "Salary Advance deductions";
 
@@ -39,39 +49,17 @@ function glpPushRecoveredLedgerSnapshot_(attendanceSS) {
     hrDecision: req("HR DECISION"),
     recoveredAmt: req("RECOVERED AMOUNT"),
     payroll: req("PAYROLL STATUS"),
+    settlementStage: req("SETTLEMENT STAGE"),
+    lastWorkingDay: req("LAST WORKING DAY"),
   };
 
   const values = sh
     .getRange(2, 1, lastRow - 1, lastCol)
     .getDisplayValues();
 
-  const out = [];
+  const closeInByKey = glpReadCloseInMonths_(workingsSS);
 
-  values.forEach(r => {
-    const ref = String(r[A.ref] || "").trim();
-    if (!ref) return;
-
-    const payroll = String(r[A.payroll] || "")
-      .trim()
-      .toUpperCase();
-
-    if (!payroll.startsWith("LOCKED")) return;
-
-    out.push([
-      attendanceFileName,
-      r[A.month] || "",
-      r[A.emp] || "",
-      r[A.name] || "",
-      r[A.dept] || "",
-      ref,
-      r[A.emiAmt] || "",
-      r[A.curBal] || "",
-      r[A.hrDecision] || "",
-      r[A.recoveredAmt] || "",
-    ]);
-  });
-
-  if (!out.length) return;
+  /* ---- Open the ledger and resolve ITS columns by header ---- */
 
   const masterSS = SpreadsheetApp.openById(GLP_SALARY_ADVANCE_MASTER_ID);
 
@@ -85,11 +73,87 @@ function glpPushRecoveredLedgerSnapshot_(attendanceSS) {
     );
   }
 
+  const ledWidth = led.getLastColumn();
+
+  const ledHeaders = led
+    .getRange(1, 1, 1, ledWidth)
+    .getDisplayValues()[0]
+    .map(h => String(h || "").trim().toUpperCase());
+
+  function ledCol(header) {
+    const key = String(header || "").trim().toUpperCase();
+    const i = ledHeaders.indexOf(key);
+    if (i === -1) {
+      throw new Error(
+        `Missing required header in ${GLP_RECOVERED_LEDGER_SHEET_NAME}: ${header}`
+      );
+    }
+    return i;
+  }
+
+  // Every destination resolved by name, so the ledger's columns can be reordered or
+  // added to without this write landing in the wrong place.
+  const L = {
+    file: ledCol("ATTENDANCE FILE NAME"),
+    month: ledCol("MONTH"),
+    emp: ledCol("EMPLOYEE CODE"),
+    name: ledCol("NAME"),
+    dept: ledCol("DEPARTMENT"),
+    ref: ledCol("EMI REFERENCE NUMBER"),
+    emiAmt: ledCol("EMI AMOUNT"),
+    curBal: ledCol("CURRENT BALANCE"),
+    hrDecision: ledCol("HR DECISION"),
+    recoveredAmt: ledCol("RECOVERED AMOUNT"),
+    settlementStage: ledCol("SETTLEMENT STAGE"),
+    lastWorkingDay: ledCol("LAST WORKING DAY"),
+    closeIn: ledCol("CLOSE IN MONTHS"),
+  };
+
+  /* ---- Build the rows ---- */
+
+  const out = [];
+
+  values.forEach(r => {
+    const ref = String(r[A.ref] || "").trim();
+    if (!ref) return;
+
+    const payroll = String(r[A.payroll] || "")
+      .trim()
+      .toUpperCase();
+
+    if (!payroll.startsWith("LOCKED")) return;
+
+    const emp = String(r[A.emp] || "").trim();
+
+    const row = new Array(ledWidth).fill("");
+
+    row[L.file] = attendanceFileName;
+    row[L.month] = r[A.month] || "";
+    row[L.emp] = emp;
+    row[L.name] = r[A.name] || "";
+    row[L.dept] = r[A.dept] || "";
+    row[L.ref] = ref;
+    row[L.emiAmt] = r[A.emiAmt] || "";
+    row[L.curBal] = r[A.curBal] || "";
+    row[L.hrDecision] = r[A.hrDecision] || "";
+    row[L.recoveredAmt] = r[A.recoveredAmt] || "";
+    row[L.settlementStage] = r[A.settlementStage] || "";
+    row[L.lastWorkingDay] = r[A.lastWorkingDay] || "";
+    row[L.closeIn] =
+      closeInByKey[`${emp.toUpperCase()}||${ref.toUpperCase()}`] || "";
+
+    out.push(row);
+  });
+
+  if (!out.length) return;
+
+  /* ---- Never push the same attendance file twice ---- */
+
   const ledLastRow = led.getLastRow();
 
   if (ledLastRow >= 2) {
     const existing = led
-      .getRange(2, 1, ledLastRow - 1, 1)
+      .getRange(2, L.file + 1, ledLastRow - 1, 1)
       .getDisplayValues();
 
     const alreadyExists = existing.some(r =>
@@ -99,16 +163,18 @@ function glpPushRecoveredLedgerSnapshot_(attendanceSS) {
     if (alreadyExists) return;
   }
 
+  /* ---- Append below the last used row of the file-name column ---- */
+
   const maxRows = led.getMaxRows();
 
-  const colA = led
-    .getRange(1, 1, maxRows, 1)
+  const fileCol = led
+    .getRange(1, L.file + 1, maxRows, 1)
     .getDisplayValues();
 
   let startRow = 2;
 
-  for (let i = colA.length - 1; i >= 0; i--) {
-    if (String(colA[i][0] || "").trim() !== "") {
+  for (let i = fileCol.length - 1; i >= 0; i--) {
+    if (String(fileCol[i][0] || "").trim() !== "") {
       startRow = i + 2;
       break;
     }
@@ -124,6 +190,47 @@ function glpPushRecoveredLedgerSnapshot_(attendanceSS) {
   }
 
   led
-    .getRange(startRow, 1, out.length, out[0].length)
+    .getRange(startRow, 1, out.length, ledWidth)
     .setValues(out);
+}
+
+/**
+ * "Close In Months" from the approval tab, keyed "EMPCODE||EMIREF".
+ *
+ * Returns an empty map rather than throwing when the tab or column is absent — a month with
+ * no plan is the normal case, and an advance schedule is not worth failing a lock over. The
+ * approval tab itself is already required by Generate Locked Payroll's own prechecks.
+ */
+function glpReadCloseInMonths_(workingsSS) {
+  const out = {};
+  if (!workingsSS) return out;
+
+  const sh = workingsSS.getSheetByName("Salary Advance Approval");
+  if (!sh) return out;
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return out;
+
+  const headers = sh
+    .getRange(1, 1, 1, sh.getLastColumn())
+    .getDisplayValues()[0]
+    .map(h => String(h || "").trim().toUpperCase());
+
+  const empIdx   = headers.indexOf("EMPLOYEE CODE");
+  const refIdx   = headers.indexOf("EMI REFERENCE NUMBER");
+  const closeIdx = headers.indexOf("CLOSE IN MONTHS");
+  if (empIdx === -1 || refIdx === -1 || closeIdx === -1) return out;
+
+  const rows = sh
+    .getRange(2, 1, lastRow - 1, sh.getLastColumn())
+    .getDisplayValues();
+
+  rows.forEach(r => {
+    const emp = String(r[empIdx] || "").trim().toUpperCase();
+    const ref = String(r[refIdx] || "").trim().toUpperCase();
+    const n   = String(r[closeIdx] || "").trim();
+    if (emp && ref && n) out[`${emp}||${ref}`] = n;
+  });
+
+  return out;
 }

@@ -1,0 +1,355 @@
+/**
+ * Update Salary Advance Recovered Amount
+ *
+ * The commit step of the salary-advance approval flow. The admin has reviewed
+ * the "Salary Advance Approval" tab, set the recovery figure, and possibly
+ * overridden a SKIP. This writes their decision into payroll and freezes it.
+ *
+ * WHAT IT WRITES — one thing only:
+ *   PAY_ROLL!Advance Deduction, per employee, as the sum of that employee's
+ *   approved Planned EMI from the approval tab.
+ *
+ * WHAT IT DELIBERATELY DOES NOT TOUCH:
+ *   The attendance file. That write is deferred to Generate Locked Payroll, so
+ *   nothing disturbs ATTENDANCE_VALIDATION between Validate Attendance and the
+ *   lock. The attendance file goes from validated straight to locked.
+ *
+ * WHY THE META CHECK NEEDS NO REFRESH:
+ *   META_DATA's "Advance Deduction Total" is =IF(B2="","", sum(PAY_ROLL!AR1:AR))
+ *   — a live formula over the very column written here — so it recalculates on
+ *   its own. Generate Locked Payroll then compares it against the approval tab
+ *   total, which verifies both that this ran and that it wrote the right figure.
+ *
+ * GUARDS (all blocking):
+ *   1. Approval tab has rows
+ *   2. Every row's Month matches META_DATA -> PAYROLL_MONTH_LABEL
+ *   3. No "ERROR:" in the Alert column   ("WARN:" is allowed through)
+ *
+ * ON SUCCESS:
+ *   Stamps "Updated On" with month label + timestamp, and fully protects the
+ *   tab. Re-running Validate Payroll clears that stamp and re-opens the entry
+ *   columns — that is the "unlock and revise" path, and it is what makes the
+ *   timestamp alone a sufficient guard at lock time.
+ *
+ * USER GATE:
+ * ✅ pmo@butlerleather.com        → runs directly
+ * ✅ nazneen@butlerleather.com    → runs via Web App (as owner)
+ * ✅ Others                       → blocked
+ */
+
+const USA_OWNER_EMAIL   = 'pmo@butlerleather.com';
+const USA_ALLOWED_EMAIL = 'nazneen@butlerleather.com';
+
+const USA_APPROVAL_TAB = 'Salary Advance Approval';
+
+/* =========================================================
+   ENTRY POINT
+========================================================= */
+
+function updateSalaryAdvanceRecoveredAmount() {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const currentUser = String(
+      (Session.getEffectiveUser() && Session.getEffectiveUser().getEmail()) || ''
+    ).trim().toLowerCase();
+
+    // ── Owner: run directly ──
+    if (currentUser === USA_OWNER_EMAIL.toLowerCase()) {
+      const result = updateSalaryAdvanceRecoveredAmountServer_({
+        spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+        requestedBy: currentUser,
+        runMode: 'direct',
+      });
+      if (result && result.message) {
+        ui.alert('Update Salary Advance Recovered Amount', result.message, ui.ButtonSet.OK);
+      }
+      return;
+    }
+
+    // ── Allowed user: call Web App (runs as owner) ──
+    if (currentUser === USA_ALLOWED_EMAIL.toLowerCase()) {
+      if (!GLP_WEBAPP_URL || GLP_WEBAPP_URL === 'PASTE_YOUR_WEBAPP_URL_HERE') {
+        ui.alert(
+          'Update Salary Advance Recovered Amount',
+          'Web App URL is not configured. Please deploy the Web App and paste the URL in GLP_WEBAPP_URL.',
+          ui.ButtonSet.OK
+        );
+        return;
+      }
+
+      const response = UrlFetchApp.fetch(GLP_WEBAPP_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({
+          action: 'updateSalaryAdvanceRecoveredAmount',
+          spreadsheetId: SpreadsheetApp.getActiveSpreadsheet().getId(),
+          requestedBy: currentUser,
+        }),
+        muteHttpExceptions: true,
+      });
+
+      const result = JSON.parse(response.getContentText() || '{}');
+      if (result.message) {
+        ui.alert('Update Salary Advance Recovered Amount', result.message, ui.ButtonSet.OK);
+      }
+      return;
+    }
+
+    // ── Anyone else: blocked ──
+    ui.alert(
+      'Update Salary Advance Recovered Amount',
+      'You are not authorized to run this function.',
+      ui.ButtonSet.OK
+    );
+
+  } catch (err) {
+    ui.alert(
+      'Update Salary Advance Recovered Amount',
+      `Error: ${err && err.message ? err.message : err}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/* =========================================================
+   CORE SERVER FUNCTION (runs as owner always)
+========================================================= */
+
+function updateSalaryAdvanceRecoveredAmountServer_(payload) {
+  const spreadsheetId = String(payload.spreadsheetId || '').trim();
+  const requestedBy   = String(payload.requestedBy || '').trim();
+
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+
+  const apSh      = ss.getSheetByName(USA_APPROVAL_TAB);
+  const metaSh    = ss.getSheetByName('META_DATA');
+  const payrollSh = ss.getSheetByName('PAY_ROLL');
+
+  if (!apSh)      return { success: false, message: `Tab not found: ${USA_APPROVAL_TAB}` };
+  if (!metaSh)    return { success: false, message: 'Tab not found: META_DATA' };
+  if (!payrollSh) return { success: false, message: 'Tab not found: PAY_ROLL' };
+
+  const meta       = getMetaKeyValueMap_(metaSh);
+  const monthLabel = String(meta['PAYROLL_MONTH_LABEL'] || '').trim();
+  if (!monthLabel) {
+    return { success: false, message: 'META_DATA -> PAYROLL_MONTH_LABEL is empty.' };
+  }
+
+  const monthStart = parseMonthYearLabelToMonthStart_(monthLabel);
+  if (!monthStart) {
+    return {
+      success: false,
+      message: `PAYROLL_MONTH_LABEL is invalid: "${monthLabel}".\nExpected something like "April_2025".`,
+    };
+  }
+
+  /* ---- Read the approval tab ---- */
+  const lastRow = apSh.getLastRow();
+  if (lastRow < 2) {
+    return {
+      success: false,
+      message: `${USA_APPROVAL_TAB} is empty.\n\nRun "Validate Payroll" first to load this month's EMI rows.`,
+    };
+  }
+
+  const aHdr = buildHeaderIndexMap_(
+    apSh.getRange(1, 1, 1, apSh.getLastColumn()).getDisplayValues()[0].map(h => String(h || '').trim())
+  );
+
+  const needed = ['Month', 'Employee Code', 'EMI Reference Number', 'Planned EMI', 'Alert', 'Updated On'];
+  const missing = needed.filter(h => aHdr[h] == null);
+  if (missing.length) {
+    return {
+      success: false,
+      message: `${USA_APPROVAL_TAB} is missing header(s):\n- ${missing.join('\n- ')}`,
+    };
+  }
+
+  const rows = apSh.getRange(2, 1, lastRow - 1, apSh.getLastColumn()).getValues();
+
+  /* ---- Guard: month must match, and errors must be cleared ---- */
+  const monthMismatch = [];
+  const errorRows     = [];
+  const plannedByEmp  = {};
+  let   emiRowCount   = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const row     = rows[i];
+    const empCode = String(row[aHdr['Employee Code']] || '').trim();
+    const ref     = String(row[aHdr['EMI Reference Number']] || '').trim();
+    if (!empCode || !ref) continue;
+
+    emiRowCount++;
+    const sheetRow = i + 2;
+
+    // Month
+    const rowMonth = usaToMonthStart_(row[aHdr['Month']]);
+    if (!rowMonth || rowMonth.getTime() !== monthStart.getTime()) {
+      monthMismatch.push(`row ${sheetRow} · ${empCode} · ${ref}`);
+    }
+
+    // Alert — ERROR blocks, WARN does not
+    const alert = String(row[aHdr['Alert']] || '').trim();
+    if (alert.toUpperCase().indexOf('ERROR') === 0) {
+      errorRows.push(`${empCode} · ${ref} — ${alert.replace(/^ERROR:\s*/i, '')}`);
+    }
+
+    // Planned EMI, summed per employee
+    const planned = usaToNumber_(row[aHdr['Planned EMI']]);
+    const key     = empCode.toUpperCase();
+    plannedByEmp[key] = (plannedByEmp[key] || 0) + planned;
+  }
+
+  if (!emiRowCount) {
+    return {
+      success: false,
+      message: `${USA_APPROVAL_TAB} has no EMI rows.\n\nRun "Validate Payroll" first.`,
+    };
+  }
+
+  if (monthMismatch.length) {
+    return {
+      success: false,
+      message:
+        `Month mismatch. The approval tab is not for ${monthLabel}.\n\n` +
+        `Run "Validate Payroll" to refresh it.\n\n` +
+        monthMismatch.slice(0, 10).join('\n') +
+        (monthMismatch.length > 10 ? `\n…and ${monthMismatch.length - 10} more` : ''),
+    };
+  }
+
+  if (errorRows.length) {
+    return {
+      success: false,
+      message:
+        `Cannot update — ${errorRows.length} row(s) still have errors:\n\n` +
+        errorRows.slice(0, 12).join('\n') +
+        (errorRows.length > 12 ? `\n…and ${errorRows.length - 12} more` : '') +
+        `\n\nFix them on the ${USA_APPROVAL_TAB} tab, then run this again.`,
+    };
+  }
+
+  /* ---- Write PAY_ROLL -> Advance Deduction ---- */
+  const pLastRow = payrollSh.getLastRow();
+  if (pLastRow < 2) return { success: false, message: 'PAY_ROLL has no data rows.' };
+
+  const pHdr = buildHeaderIndexMap_(
+    payrollSh.getRange(1, 1, 1, payrollSh.getLastColumn()).getDisplayValues()[0].map(h => String(h || '').trim())
+  );
+  if (pHdr['Employee Code'] == null)     return { success: false, message: 'PAY_ROLL is missing "Employee Code".' };
+  if (pHdr['Advance Deduction'] == null) return { success: false, message: 'PAY_ROLL is missing "Advance Deduction".' };
+
+  const pEmpCol = payrollSh.getRange(2, pHdr['Employee Code'] + 1, pLastRow - 1, 1).getValues();
+
+  // Every employee gets a value, including 0 — leaving a stale figure behind
+  // for someone whose advance closed would silently over-deduct.
+  const advValues  = [];
+  let   matched    = 0;
+  let   totalWritten = 0;
+
+  for (let i = 0; i < pEmpCol.length; i++) {
+    const empCode = String(pEmpCol[i][0] || '').trim();
+    if (!empCode) { advValues.push(['']); continue; }
+
+    const amount = plannedByEmp[empCode.toUpperCase()] || 0;
+    if (plannedByEmp[empCode.toUpperCase()] != null) matched++;
+    totalWritten += amount;
+    advValues.push([amount]);
+  }
+
+  payrollSh.getRange(2, pHdr['Advance Deduction'] + 1, advValues.length, 1).setValues(advValues);
+
+  /* ---- Stamp and freeze ---- */
+  const stamp = usaBuildStamp_(monthLabel);
+  apSh.getRange(2, aHdr['Updated On'] + 1, emiRowCount, 1)
+      .setValues(new Array(emiRowCount).fill([stamp]));
+
+  usaLockApprovalTab_(apSh, monthLabel);
+
+  SpreadsheetApp.flush();
+
+  const empCount = Object.keys(plannedByEmp).length;
+  const warnRows = rows.filter(r => String(r[aHdr['Alert']] || '').trim().toUpperCase().indexOf('WARN') === 0).length;
+
+  let message =
+    'Salary advance recovery updated.\n\n' +
+    `EMI rows approved: ${emiRowCount}\n` +
+    `Employees affected: ${empCount}\n` +
+    `Total Advance Deduction written: ${totalWritten}\n` +
+    `Stamped: ${stamp}\n`;
+
+  if (warnRows) {
+    message += `\n${warnRows} row(s) carried a warning — review them if that was not intended.\n`;
+  }
+
+  message +=
+    `\nThe ${USA_APPROVAL_TAB} tab is now locked. ` +
+    'To revise, run "Validate Payroll" again — that clears the stamp and re-opens the entry columns.\n\n' +
+    'You can now run Generate Locked Payroll.';
+
+  if (requestedBy) message += `\n\nRequested by: ${requestedBy}`;
+
+  return { success: true, message };
+}
+
+/* =========================================================
+   Helpers
+========================================================= */
+
+/** Stamp carries the month so a copy of the template cannot look pre-approved. */
+function usaBuildStamp_(monthLabel) {
+  const tz = Session.getScriptTimeZone();
+  return `${monthLabel} | ${Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm')}`;
+}
+
+/** The month label a stamp was written for, or '' if unparseable. */
+function usaStampMonthLabel_(stamp) {
+  const s = String(stamp || '').trim();
+  if (!s) return '';
+  const parts = s.split('|');
+  return String(parts[0] || '').trim();
+}
+
+/** First of the month for a Date, or for a "January_2026"-style string. */
+function usaToMonthStart_(v) {
+  if (v == null || String(v).trim() === '') return null;
+
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    return new Date(v.getFullYear(), v.getMonth(), 1);
+  }
+
+  const viaLabel = parseMonthYearLabelToMonthStart_(String(v).trim());
+  if (viaLabel) return viaLabel;
+
+  const d = new Date(String(v).trim());
+  if (!isNaN(d.getTime())) return new Date(d.getFullYear(), d.getMonth(), 1);
+
+  return null;
+}
+
+/** Number from a raw cell value. Tolerates commas; never returns NaN. */
+function usaToNumber_(v) {
+  if (v === '' || v == null) return 0;
+  const n = (typeof v === 'number') ? v : Number(String(v).replace(/,/g, '').trim());
+  return isNaN(n) ? 0 : n;
+}
+
+/** Full lock — no unprotected ranges. Validate Payroll re-opens the entry columns. */
+function usaLockApprovalTab_(apSh, monthLabel) {
+  try {
+    apSh.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+        .forEach(p => { try { p.remove(); } catch (_) {} });
+  } catch (_) {}
+
+  try {
+    const protection = apSh.protect();
+    protection.setDescription(`SALARY_ADVANCE_APPROVAL_LOCK_${monthLabel}`);
+    protection.setWarningOnly(false);
+    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    try { protection.addEditors([USA_OWNER_EMAIL]); } catch (_) {}
+    try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+  } catch (_) {
+    // Protection is a convenience. Never fail a write that already succeeded.
+  }
+}

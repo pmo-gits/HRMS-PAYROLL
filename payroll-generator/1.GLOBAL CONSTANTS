@@ -44,6 +44,7 @@ const CONST = Object.freeze({
     OTHER_PAYMENTS: 'Other Payments',
     OTHER_DEDUCTIONS: 'Other Deductions',
     SALARY_ADVANCE_DEDUCTIONS: 'Salary Advance deductions',
+    SALARY_ADVANCE_APPROVAL: 'Salary Advance Approval',
     META_DATA: 'META_DATA',
     FIXED_SALARY_CHECK: 'FIXED_SALARY_CHECK',
     PAYROLL_CONTROL_CENTER: 'PAYROLL_CONTROL',

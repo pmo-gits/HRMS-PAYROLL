@@ -25,6 +25,13 @@
  * ✅ ADDITIONAL GUARD:
  * - Both buttons run ONLY when active sheet is "Salary Advance deductions"
  *
+ * ✅ Settlement carry-forward (2d):
+ * - Settlement Stage + Last Working Day are read from Master EMI_SCHEDULE and written by
+ *   applySettlementColumns_(), as a SEPARATE write from the 7-field snapshot pipeline
+ * - Settlement Stage is always protected (system-written)
+ * - Last Working Day is protected only on rows already carrying a Settlement Stage; on all
+ *   other rows it stays open so HR can record a departure
+ *
  * ✅ SA Run Timestamp:
  * - writeToDeductions_() always writes timestamp in row 2 of "SA Run Timestamp" column
  * - Written even when no EMI rows found (button was clicked = SA was run)
@@ -96,6 +103,7 @@ function getSalaryAdvanceEMI_Button() {
     if (!rowsFromSchedule7.length) {
       // ✅ No EMI rows found — still write timestamp then inform user
       writeToDeductions_(deductions, [], /*clearBefore*/ false);
+      applySettlementColumns_(deductions, [], new Map());
       ui.alert("Info", `No ACTIVE EMI rows found in master EMI_SCHEDULE for ${monthKey}.`, ui.ButtonSet.OK);
       return;
     }
@@ -108,7 +116,15 @@ function getSalaryAdvanceEMI_Button() {
   // Clears ONLY: Month..Current Balance + HR Decision
   // Does NOT clear Planned EMI / Payroll Status
   const out8 = rows7.map(r7 => [...r7, ""]); // add HR Decision blank
+
+  // Captured BEFORE the write — writeToDeductions_ reshuffles rows (see helper note)
+  const priorLwd = captureTypedLastWorkingDay_(deductions);
   writeToDeductions_(deductions, out8, /*clearBefore*/ true);
+
+  // ✅ Settlement carry-forward — written separately, NOT folded into rows7 (see helper note)
+  applySettlementColumns_(
+    deductions, out8, fetchSettlementMapFromMasterSchedule_(master, monthKey), priorLwd
+  );
 
   ui.alert("Done", `Loaded ${out8.length} EMI rows for ${monthKey}.`, ui.ButtonSet.OK);
 }
@@ -180,7 +196,15 @@ function refreshSalaryAdvanceEMI_Button() {
   // - Clear ONLY columns: Month..HR Decision (A:H by header mapping)
   // - Paste fresh list (Month..Current Balance + HR Decision blank)
   const out8 = snapshotRows7.map(r7 => [...r7, ""]); // add HR Decision blank
+
+  // Captured BEFORE the write — writeToDeductions_ reshuffles rows (see helper note)
+  const priorLwd = captureTypedLastWorkingDay_(deductions);
   writeToDeductions_(deductions, out8, /*clearBefore*/ true);
+
+  // ✅ Settlement carry-forward — written separately, NOT folded into rows7 (see helper note)
+  applySettlementColumns_(
+    deductions, out8, fetchSettlementMapFromMasterSchedule_(master, monthKey), priorLwd
+  );
 
   ui.alert("Done", `Refreshed EMI rows for ${monthKey}. Rows loaded: ${out8.length}`, ui.ButtonSet.OK);
 }
@@ -366,21 +390,228 @@ function fetchActiveRowsFromMasterSchedule_(masterSpreadsheet, monthKey) {
   return out;
 }
 
+/**
+ * Settlement Stage + Last Working Day for this month, keyed "EMPCODE||EMIREF".
+ *
+ * Deliberately a SEPARATE read from fetchActiveRowsFromMasterSchedule_(): that function's
+ * 7-field tuple feeds appendToMasterShared_() and the 9-column "Shared EMI Summary" contract,
+ * and widening it would force schema changes through four functions and that master tab.
+ * Settlement data is read straight from EMI_SCHEDULE instead, and never travels via the snapshot.
+ *
+ * Not filtered by Status — a row whose settlement has just concluded still needs its stage
+ * shown, and the deduction rows themselves are already the ACTIVE set.
+ */
+function fetchSettlementMapFromMasterSchedule_(masterSpreadsheet, monthKey) {
+  const sh = masterSpreadsheet.getSheetByName(MASTER_EMI_SCHEDULE_SHEET_NAME);
+  if (!sh) throw new Error(`Master tab not found: ${MASTER_EMI_SCHEDULE_SHEET_NAME}`);
+
+  const values = sh.getDataRange().getValues();
+  const map = new Map();
+  if (values.length < 2) return map;
+
+  const headers = values[0].map(h => String(h || "").trim());
+  const idx = headerIndexMapCaseSensitive_(headers);
+
+  const required = ["Month", "Employee Code", "EMI Reference Number", "Settlement Stage", "Last Working Day"];
+  const missing = required.filter(h => idx[h] == null);
+  if (missing.length) {
+    throw new Error(`Missing headers in Master ${MASTER_EMI_SCHEDULE_SHEET_NAME}: ${missing.join(", ")}`);
+  }
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (normalizeMonthToKey_(row[idx["Month"]]) !== monthKey) continue;
+
+    const emp = String(row[idx["Employee Code"]] || "").trim().toUpperCase();
+    const ref = String(row[idx["EMI Reference Number"]] || "").trim().toUpperCase();
+    if (!emp || !ref) continue;
+
+    map.set(`${emp}||${ref}`, {
+      stage: String(row[idx["Settlement Stage"]] || "").trim(),
+      lwd: row[idx["Last Working Day"]],
+    });
+  }
+
+  return map;
+}
+
+/**
+ * Writes Settlement Stage + Last Working Day alongside the rows just written by
+ * writeToDeductions_(), then re-applies protection.
+ *
+ * Protection rules:
+ *  - Settlement Stage is system-written, never typed. Protected across the whole used range.
+ *  - Last Working Day is HR's input in the DECISION month, but is carried forward by the system
+ *    in every settlement month after it. So it is protected ONLY on rows that already carry a
+ *    Settlement Stage — rows without one stay open for HR to record a departure.
+ *
+ * Protections are removed BEFORE the writes: these buttons can run directly as a delegate, not
+ * only as the owner, and a live protection would make the clear/write fail.
+ */
+function applySettlementColumns_(deductionsSheet, rows8, settlementMap, priorLwd) {
+  const prevLwd = priorLwd instanceof Map ? priorLwd : new Map();
+  const headers = getHeaderRow_(deductionsSheet);
+  const stageCol = indexOfHeader_(headers, "SETTLEMENT STAGE") + 1;
+  const lwdCol = indexOfHeader_(headers, "LAST WORKING DAY") + 1;
+
+  if (stageCol <= 0 || lwdCol <= 0) {
+    const missing = [];
+    if (stageCol <= 0) missing.push("Settlement Stage");
+    if (lwdCol <= 0) missing.push("Last Working Day");
+    throw new Error(
+      `Missing header(s) in "${SALARY_ADVANCE_DEDUCTIONS_SHEET_NAME}": ${missing.join(", ")}`
+    );
+  }
+
+  // 1) Drop our own previous protections so the clear/write below cannot be blocked.
+  deductionsSheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(p => {
+    const desc = p.getDescription() || "";
+    if (desc.startsWith(SETTLEMENT_PROTECTION_PREFIX)) {
+      try { p.remove(); } catch (e) {}
+    }
+  });
+
+  // 2) Clear both columns — row order changes between refreshes, so stale values would misalign.
+  const maxRows = deductionsSheet.getMaxRows();
+  const clearRows = Math.max(maxRows - 1, 0);
+  if (clearRows > 0) {
+    deductionsSheet.getRange(2, stageCol, clearRows, 1).clearContent();
+    deductionsSheet.getRange(2, lwdCol, clearRows, 1).clearContent();
+  }
+
+  if (!rows8 || !rows8.length) return;
+
+  // 3) Align to the rows just written. rows8 field order comes from writeToDeductions_'s
+  //    writeOrder: [Month, Employee Code, Name, Department, EMI Reference Number, ...]
+  const stageVals = [];
+  const lwdVals = [];
+  const settledOffsets = [];
+
+  rows8.forEach((r, i) => {
+    const emp = String(r[1] || "").trim().toUpperCase();
+    const ref = String(r[4] || "").trim().toUpperCase();
+    const key = `${emp}||${ref}`;
+    const hit = settlementMap.get(key);
+
+    const stage = hit ? String(hit.stage || "").trim() : "";
+    const carried = hit && hit.lwd !== "" && hit.lwd != null ? hit.lwd : "";
+
+    stageVals.push([stage]);
+
+    // The master wins when it has a date to carry down; otherwise restore whatever HR had
+    // typed before the clear. Only genuinely new rows end up blank.
+    if (carried !== "") lwdVals.push([carried]);
+    else if (prevLwd.has(key)) lwdVals.push([prevLwd.get(key)]);
+    else lwdVals.push([""]);
+
+    if (stage) settledOffsets.push(i);
+  });
+
+  deductionsSheet.getRange(2, stageCol, stageVals.length, 1).setValues(stageVals);
+  deductionsSheet.getRange(2, lwdCol, lwdVals.length, 1).setValues(lwdVals);
+
+  // 4) Re-protect.
+  protectSettlementRange_(
+    deductionsSheet,
+    deductionsSheet.getRange(2, stageCol, rows8.length, 1),
+    `${SETTLEMENT_PROTECTION_PREFIX}STAGE`
+  );
+
+  buildContinuousRowBlocks_(settledOffsets).forEach((blk, n) => {
+    protectSettlementRange_(
+      deductionsSheet,
+      deductionsSheet.getRange(2 + blk.start, lwdCol, blk.count, 1),
+      `${SETTLEMENT_PROTECTION_PREFIX}LWD_${n}`
+    );
+  });
+}
+
+/**
+ * Snapshot of any HR-typed Last Working Day, keyed "EMPCODE||EMIREF".
+ *
+ * MUST be called BEFORE writeToDeductions_(): that function reshuffles the rows, so reading
+ * the date column afterwards would pair old dates with whichever employee now sits in that row.
+ */
+function captureTypedLastWorkingDay_(deductionsSheet) {
+  const map = new Map();
+  const headers = getHeaderRow_(deductionsSheet);
+
+  const empCol = indexOfHeader_(headers, "EMPLOYEE CODE") + 1;
+  const refCol = indexOfHeader_(headers, "EMI REFERENCE NUMBER") + 1;
+  const lwdCol = indexOfHeader_(headers, "LAST WORKING DAY") + 1;
+  if (empCol <= 0 || refCol <= 0 || lwdCol <= 0) return map;
+
+  const lastRow = deductionsSheet.getLastRow();
+  if (lastRow < 2) return map;
+
+  const n = lastRow - 1;
+  const emps = deductionsSheet.getRange(2, empCol, n, 1).getDisplayValues();
+  const refs = deductionsSheet.getRange(2, refCol, n, 1).getDisplayValues();
+  const lwds = deductionsSheet.getRange(2, lwdCol, n, 1).getValues();
+
+  for (let i = 0; i < n; i++) {
+    const e = String(emps[i][0] || "").trim().toUpperCase();
+    const f = String(refs[i][0] || "").trim().toUpperCase();
+    if (!e || !f) continue;
+    if (lwds[i][0] !== "" && lwds[i][0] != null) map.set(`${e}||${f}`, lwds[i][0]);
+  }
+
+  return map;
+}
+
+function protectSettlementRange_(sheet, range, description) {
+  const protection = range.protect();
+  protection.setDescription(description);
+  protection.setWarningOnly(false);
+  try {
+    protection.removeEditors(protection.getEditors());
+    if (protection.canDomainEdit()) protection.setDomainEdit(false);
+  } catch (e) {}
+}
+
+/** [0,1,2,5,6] -> [{start:0,count:3},{start:5,count:2}] — one protection per run, not per row. */
+function buildContinuousRowBlocks_(offsets) {
+  if (!offsets || !offsets.length) return [];
+
+  const sorted = offsets.slice().sort((a, b) => a - b);
+  const blocks = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] === prev + 1) { prev = sorted[i]; continue; }
+    blocks.push({ start, count: prev - start + 1 });
+    start = sorted[i];
+    prev = sorted[i];
+  }
+  blocks.push({ start, count: prev - start + 1 });
+
+  return blocks;
+}
+
 function appendToMasterShared_(masterSharedSheet, attendanceFileName, rows7) {
   if (!rows7.length) return;
 
   const existing = masterSharedSheet.getDataRange().getValues();
   const seen = new Set();
+  const rowByKey = new Map(); // key -> 1-based sheet row, for the open-month refresh below
 
   for (let r = 1; r < existing.length; r++) {
     const file = String(existing[r][0] || "").trim();
     const mk = normalizeMonthToKey_(existing[r][1]);
     const emp = String(existing[r][2] || "").trim();
     const ref = String(existing[r][5] || "").trim();
-    if (file && mk && emp && ref) seen.add([file, mk, emp, ref].join("|"));
+    if (file && mk && emp && ref) {
+      const k = [file, mk, emp, ref].join("|");
+      seen.add(k);
+      // col 9 (index 8) = Payroll Status. Blank means the month is not locked yet.
+      if (String(existing[r][8] || "").trim() === "") rowByKey.set(k, r + 1);
+    }
   }
 
   const toAppend = [];
+  const toRefresh = []; // [sheetRow, EMI Amount, Current Balance]
+
   for (const r7 of rows7) {
     const mk = normalizeMonthToKey_(r7[0]);
     const emp = String(r7[1] || "").trim();
@@ -390,8 +621,21 @@ function appendToMasterShared_(masterSharedSheet, attendanceFileName, rows7) {
     if (!seen.has(key)) {
       toAppend.push([attendanceFileName, ...r7, ""]);
       seen.add(key);
+      continue;
     }
+
+    // Already snapshotted. Dedupe still applies - no second row is ever added - but for a
+    // month that is NOT yet locked the two numeric columns are refreshed from EMI_SCHEDULE.
+    // Without this a settlement rebalance (14000 -> 12900) could never reach the attendance
+    // file, because both buttons read this snapshot rather than EMI_SCHEDULE. A locked month
+    // is left untouched: it is an audit record.
+    const sheetRow = rowByKey.get(key);
+    if (sheetRow) toRefresh.push([sheetRow, r7[5], r7[6]]);
   }
+
+  toRefresh.forEach(([sheetRow, emiAmt, curBal]) => {
+    masterSharedSheet.getRange(sheetRow, 7, 1, 2).setValues([[emiAmt, curBal]]);
+  });
 
   if (toAppend.length) {
     masterSharedSheet
@@ -472,5 +716,14 @@ function writeToDeductions_(deductionsSheet, rows, clearBefore) {
     if (c <= 0) continue;
     const colVals = rows.map(r => [r[i]]);
     deductionsSheet.getRange(startRow, c, numRows, 1).setValues(colVals);
+  }
+
+  // ✅ Month arrives from EMI_SCHEDULE as a real Date, and Validate Attendance compares it with
+  // getDisplayValues() — so the DISPLAY FORMAT decides whether the month matches. Without this
+  // the same Date renders as "8/1/2026" in a freshly copied file and "August_2026" in one that
+  // happened to be formatted by hand, and validation fails on the new file.
+  const monthCol = colIndex("MONTH");
+  if (monthCol > 0) {
+    deductionsSheet.getRange(startRow, monthCol, numRows, 1).setNumberFormat("MMMM_yyyy");
   }
 }

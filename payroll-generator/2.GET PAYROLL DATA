@@ -460,6 +460,16 @@ function getPayrollDataServer_(payload) {
   // ---- 12) Protect PAY_ROLL tab after successful data write ----
   gpdProtectPayrollTab_(ss, payroll, payrollHeaders, monthLabel);
 
+  // Stamps the moment this run genuinely completed. Validate Payroll checks
+  // this against Update Salary Advance's lock timestamp on the Salary
+  // Advance Approval tab, so it can tell a deliberate re-fetch (real reason
+  // to revalidate) apart from an accidental re-run that would otherwise
+  // silently undo an already-approved, already-locked month.
+  PropertiesService.getScriptProperties().setProperty(
+    'GET_PAYROLL_DATA_LAST_RUN',
+    Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')
+  );
+
   SpreadsheetApp.flush();
 
   const successMsg = `Done: Payroll data loaded for ${monthLabel}.`;

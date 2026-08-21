@@ -28,6 +28,9 @@ const DATE_END_COL = 39;
 
 const SUNDAY_PROTECTION_PREFIX = "AUTO_SUNDAY_PROTECT_";
 
+// Salary Advance settlement columns carried down from the master schedule (13_SalaryAdvance.gs)
+const SETTLEMENT_PROTECTION_PREFIX = "AUTO_SETTLEMENT_PROTECT_";
+
 const APPROVED_HEADERS_TO_CLEAR = [
   "APPROVED EL DAYS",
   "APPROVED SL DAYS",

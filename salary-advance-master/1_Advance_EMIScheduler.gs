@@ -68,6 +68,21 @@
  *    - Core stays UI-free per the original design — the Yes/No dialog
  *      lives only in the menu wrapper, never in Core or in 0_WebApp.gs.
  *
+ * ✅ NEW (v5) — cancelEMI_Core_ gained blocking prechecks and stopped overwriting history:
+ *    - BLOCKING: cancel now refuses outright, before writing anything, if EMI_SCHEDULE holds
+ *      any row for the reference with HR Decision = RESIGNED/ABSCOND (employee marked as
+ *      leaving), HR Decision = PAY EXTRA/PAY LESS/SKIP (a recovery decision already approved
+ *      and committed at least once), or Amount Set By = ADMIN (a Close In Months plan active).
+ *      Permanent, not "only if unresolved" — once any of these has happened on a reference,
+ *      cancel refuses forever.
+ *    - PRESERVED HISTORY: when cancel does proceed, only EMI_SCHEDULE rows that are still
+ *      untouched (Recover Amount blank AND Write Off Amount blank) are stamped CANCELLED. A
+ *      row that already recovered money, or already had a write-off booked, is a locked
+ *      record and keeps its existing Status — cancel no longer rewrites the past.
+ *    - 3A_Master_SharedEMILockSync.gs was given the matching other half: its decision loop now
+ *      skips any reference already marked CANCELLED, so a stale ledger entry can never flip a
+ *      cancelled reference's rows back to WRITE OFF/CLOSED on a later scheduled run.
+ *
  * ✅ Constants EMI_PMO_USER_, EMI_ALLOWED_USER_, EMI_WEBAPP_URL
  *    declared in 0_WebApp.gs — referenced here directly.
  *
@@ -573,12 +588,30 @@ function scheduleEMI_BuildActiveEmiConflicts_(ledVals, ledDisp, L, emiStatusIdx0
  * All cancel logic. Receives ss and emiRef — never calls
  * getActiveSpreadsheet() or any UI method internally.
  *
+ * ✅ NEW (v5) — nothing is written until every precheck below has passed. Order:
+ *   1. Read EMI_SCHEDULE rows for this ref (read-only).
+ *   2. BLOCKING PRECHECKS — refuse outright, no writes anywhere, if any row has:
+ *        HR Decision = RESIGNED / ABSCOND               → employee marked as leaving
+ *        HR Decision = PAY EXTRA / PAY LESS / SKIP       → a decision already approved once
+ *        Amount Set By = ADMIN                           → a Close In Months plan is active
+ *      These are permanent: once true for this reference, cancel refuses forever, not only
+ *      while the condition is current.
+ *   3. Only once every precheck has passed: stamp the ledger, then stamp EMI_SCHEDULE —
+ *      but ONLY rows that are still untouched (Recover Amount blank AND Write Off Amount
+ *      blank). A row that already recovered money or already had a write-off booked is a
+ *      locked record, exactly as every pass in 3A_Master_SharedEMILockSync.gs already treats
+ *      one, and keeps its existing Status.
+ *
+ * HR Decision / Amount Set By are read via opt_() rather than req_() — an older sheet
+ * missing one of these newer columns loses that one guard rather than losing Cancel EMI
+ * entirely.
+ *
  * Cancel status rules (unchanged):
- *   Recovered Amount blank or 0  → "CANCELLED"
- *   Recovered Amount > 0         → "CANCELLED & GOT PAID"
+ *   Recovered Amount (ledger, aggregate) blank or 0  → "CANCELLED"
+ *   Recovered Amount (ledger, aggregate) > 0          → "CANCELLED & GOT PAID"
  *
  * Returns: { success, message, emiRef, ledgerHits,
- *             recoveredAmtForRef, scheduleHits,
+ *             recoveredAmtForRef, scheduleHits, scheduleRowsPreserved,
  *             statusLabel, sharedRowsDeleted }
  */
 function cancelEMI_Core_(ss, emiRef) {
@@ -593,7 +626,8 @@ function cancelEMI_Core_(ss, emiRef) {
 
   const nowStamp = stamp_();
 
-  // --- Advance Ledger: find ref, read Recovered Amount, stamp scheduled status ---
+  // --- Advance Ledger: confirm the ref exists and read Recovered Amount. READ-ONLY here —
+  // the actual stamp is deferred until every precheck below has passed. ---
   const ledMap = getHeaderMap_(ledger);
   const L = {
     ref:         req_(ledMap, "EMI REFERENCE NUMBER"),
@@ -606,9 +640,9 @@ function cancelEMI_Core_(ss, emiRef) {
     ? ledger.getRange(2, 1, ledLast - 1, ledger.getLastColumn()).getValues()
     : [];
 
-  let ledgerHits         = 0;
   let recoveredAmtForRef = 0;
   let foundAny           = false;
+  const ledgerRowsToStamp = [];
 
   for (let i = 0; i < ledVals.length; i++) {
     const rref = str_(ledVals[i][L.ref]).toUpperCase();
@@ -618,24 +652,24 @@ function cancelEMI_Core_(ss, emiRef) {
       recoveredAmtForRef = num_(ledVals[i][L.recovered]);
       foundAny = true;
     }
-    ledger.getRange(i + 2, L.schedStatus + 1).setValue(`Cancelled - ${nowStamp}`);
-    ledgerHits++;
+    ledgerRowsToStamp.push(i + 2);
   }
 
   if (!foundAny) {
     return { success: false, message: `EMI Reference not found in Advance Ledger: ${emiRef}` };
   }
 
-  // ✅ STATUS label based on Recovered Amount (unchanged logic)
-  const statusLabel = (recoveredAmtForRef && recoveredAmtForRef > 0)
-    ? "CANCELLED & GOT PAID"
-    : "CANCELLED";
-
-  // --- EMI_SCHEDULE: update STATUS for all rows of this ref ---
+  // --- EMI_SCHEDULE: read every row for this ref. READ-ONLY — the prechecks need the full
+  // picture before anything is written anywhere. ---
   const schMap = getHeaderMap_(schedule);
   const S = {
     ref:    req_(schMap, "EMI REFERENCE NUMBER"),
     status: req_(schMap, "STATUS"),
+    hr:     opt_(schMap, "HR DECISION"),
+    recAmt: opt_(schMap, "RECOVER AMOUNT"),
+    woAmt:  opt_(schMap, "WRITE OFF AMOUNT"),
+    setBy:  opt_(schMap, "AMOUNT SET BY"),
+    month:  opt_(schMap, "MONTH"),
   };
 
   const schLast = schedule.getLastRow();
@@ -643,10 +677,84 @@ function cancelEMI_Core_(ss, emiRef) {
     ? schedule.getRange(2, 1, schLast - 1, schedule.getLastColumn()).getValues()
     : [];
 
-  let scheduleHits = 0;
+  const monthLabel_ = (row) => {
+    if (S.month === -1) return "";
+    const v = row[S.month];
+    if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), "MMMM_yyyy");
+    return String(v || "").trim();
+  };
+
+  const matchingRows = [];
   for (let i = 0; i < schVals.length; i++) {
     if (str_(schVals[i][S.ref]).toUpperCase() !== emiRef) continue;
-    schedule.getRange(i + 2, S.status + 1).setValue(statusLabel);
+    matchingRows.push({ r: i + 2, row: schVals[i] });
+  }
+
+  // ✅ NEW (v5) — BLOCKING PRECHECKS. Nothing has been written yet.
+  if (S.hr !== -1) {
+    for (const m of matchingRows) {
+      const decision = str_(m.row[S.hr]).toUpperCase();
+      if (decision === "RESIGNED" || decision === "ABSCOND") {
+        return {
+          success: false,
+          message: `Cancel EMI blocked: ${emiRef} has HR Decision "${decision}" recorded ` +
+                    `(${monthLabel_(m.row)}). Cancel is not permitted once an employee has ` +
+                    `been marked as leaving — use the settlement flow instead.`,
+        };
+      }
+    }
+    for (const m of matchingRows) {
+      const decision = str_(m.row[S.hr]).toUpperCase();
+      if (decision === "PAY EXTRA" || decision === "PAY LESS" || decision === "SKIP") {
+        return {
+          success: false,
+          message: `Cancel EMI blocked: ${emiRef} already has an approved "${decision}" ` +
+                    `decision (${monthLabel_(m.row)}). Cancel is not permitted once a ` +
+                    `recovery decision has been committed for this advance.`,
+        };
+      }
+    }
+  }
+  if (S.setBy !== -1) {
+    for (const m of matchingRows) {
+      if (str_(m.row[S.setBy]).toUpperCase() === "ADMIN") {
+        return {
+          success: false,
+          message: `Cancel EMI blocked: ${emiRef} has a Close In Months plan active ` +
+                    `(${monthLabel_(m.row)}). Cancel is not permitted while a plan is active.`,
+        };
+      }
+    }
+  }
+
+  // --- Every precheck passed. Now write. ---
+
+  // ✅ STATUS label based on Recovered Amount (unchanged logic)
+  const statusLabel = (recoveredAmtForRef && recoveredAmtForRef > 0)
+    ? "CANCELLED & GOT PAID"
+    : "CANCELLED";
+
+  ledgerRowsToStamp.forEach(r => {
+    ledger.getRange(r, L.schedStatus + 1).setValue(`Cancelled - ${nowStamp}`);
+  });
+  const ledgerHits = ledgerRowsToStamp.length;
+
+  // --- EMI_SCHEDULE: stamp Status, but ONLY on rows that are still untouched. ---
+  // ✅ NEW (v5) — a row already carrying a Recover Amount or a Write Off Amount is a locked
+  // record; cancel must not rewrite history, only the rows nothing has happened to yet.
+  let scheduleHits = 0;
+  let scheduleRowsPreserved = 0;
+
+  for (const m of matchingRows) {
+    const recovered  = S.recAmt === -1 ? "" : str_(m.row[S.recAmt]);
+    const writtenOff = S.woAmt  === -1 ? "" : str_(m.row[S.woAmt]);
+
+    if (recovered !== "" || writtenOff !== "") {
+      scheduleRowsPreserved++;
+      continue; // locked record — Status left exactly as it is
+    }
+
+    schedule.getRange(m.r, S.status + 1).setValue(statusLabel);
     scheduleHits++;
   }
 
@@ -670,13 +778,21 @@ function cancelEMI_Core_(ss, emiRef) {
   // Delete bottom-up to preserve row indices
   rowsToDelete.sort((a, b) => b - a).forEach(rno => shared.deleteRow(rno));
 
+  const preservedNote = scheduleRowsPreserved > 0
+    ? `\nRows preserved (already recovered or written off, left untouched): ${scheduleRowsPreserved}`
+    : "";
+
   return {
     success:            true,
-    message:            `Cancel EMI completed ✅\nRef: ${emiRef}\nLedger updated: ${ledgerHits}\nRecovered Amount: ${recoveredAmtForRef}\nEMI_SCHEDULE rows marked: ${scheduleHits}\nSTATUS set to: ${statusLabel}\nShared summary rows deleted (Payroll Status empty): ${rowsToDelete.length}`,
+    message:            `Cancel EMI completed ✅\nRef: ${emiRef}\nLedger updated: ${ledgerHits}\n` +
+                         `Recovered Amount: ${recoveredAmtForRef}\nEMI_SCHEDULE rows marked: ${scheduleHits}` +
+                         preservedNote +
+                         `\nSTATUS set to: ${statusLabel}\nShared summary rows deleted (Payroll Status empty): ${rowsToDelete.length}`,
     emiRef,
     ledgerHits,
     recoveredAmtForRef,
     scheduleHits,
+    scheduleRowsPreserved,
     statusLabel,
     sharedRowsDeleted:  rowsToDelete.length,
   };

@@ -362,16 +362,569 @@ function validatePayrollServer_(payload) {
   // ---- 5) Protect FIXED_SALARY_CHECK tab (entire tab, pmo owner only) ----
   vpProtectFixedSalaryCheckTab_(ss, payrollMonthLabel);
 
+  // ---- 6) Populate Salary Advance Approval tab (merge-pull) ----
+  // Non-fatal: FIXED_SALARY_CHECK above is already written, so a problem here is
+  // reported in the summary rather than thrown away as an error.
+  let approvalNote = '';
+  try {
+    const approvalResult = vpPopulateSalaryAdvanceApproval_(ss, meta, payrollSh, pHdr, payrollMonthLabel);
+    approvalNote = approvalResult.message;
+  } catch (approvalErr) {
+    approvalNote = 'Salary Advance Approval NOT updated: ' +
+      (approvalErr && approvalErr.message ? approvalErr.message : approvalErr);
+  }
+
   SpreadsheetApp.flush();
 
   const msg =
     'Validate Payroll completed.\n\n' +
     'Employees checked: ' + outRowCount + '\n' +
     'Employees with NO approved revision for this month: ' + noApprovedRevisionCount + '\n\n' +
+    approvalNote + '\n\n' +
     'Now review your Control Panel totals and proceed only if mismatch = 0.';
 
   if (ui) ui.alert('Validate Payroll', msg, ui.ButtonSet.OK);
   return { success: true, message: msg };
+}
+
+/* =========================================================
+   SALARY ADVANCE APPROVAL TAB
+   ---------------------------------------------------------
+   Merge-pull. Refreshes everything the admin needs to decide,
+   and PRESERVES what they have already entered.
+
+   Refreshed : Month, Employee Code, Name, Department,
+               EMI Reference Number, EMI Amount, Current Balance,
+               Settlement Stage, Last Working Day, Times Skipped,
+               Payable Days, Max Recoverable, HR Decision (from HR)
+   Preserved : Approved Decision, Entry Mode, Admin Entry
+   Cleared   : Updated On  <- invalidates any previous approval
+   Untouched : every formula column
+
+   Max Recoverable is computed HERE, in script, from four columns
+   PAY_ROLL already holds. It is NOT a PAY_ROLL column:
+       raw = (Total Earnings + Advance Deduction)
+             - Total Deductions + Other Payments [Net]
+       max = raw > 0 ? raw : 0
+   Total Earnings already has Advance Deduction subtracted, so the
+   "+ Advance Deduction" cancels it out — which is what makes this
+   figure independent of whatever is currently in the deduction
+   column, and therefore stable across the Update button's rewrite.
+========================================================= */
+
+/* Numeric-aware EMI Reference Number compare, e.g. "EMI-2" before "EMI-10"
+   (lexical order would put "EMI-10" first). Mirrors glpRefNumber_ in
+   "6.Generate Locked Payroll", kept as its own copy per this module's
+   per-file helper convention. */
+function vpRefNumber_(ref) {
+  const m = String(ref == null ? '' : ref).match(/(\d+)/);
+  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+/* An employee can only leave once, for one reason, on one date. HR Decision
+   and Last Working Day are entered per EMI row in the attendance file, so
+   nothing stops two rows for the same employee disagreeing (e.g. RESIGNED
+   on one advance, ABSCOND — or even blank — on another) — this must never
+   reach the approval tab. All-or-nothing: any conflict blocks the entire
+   refresh, naming every employee and row involved, so the fix happens once
+   in attendance rather than the admin discovering it mid-decision.
+
+   Last Working Day is checked only once HR Decision is confirmed
+   consistent, and only when that decision is RESIGNED: every one of the
+   employee's rows must have it filled (not blank), and all must agree on
+   the same date. ABSCOND/SKIP/blank never require it, matching the sheet's
+   own Alert rule (which only errors on RESIGNED with a blank LWD). */
+function vpAssertSalaryAdvanceRowsConsistentPerEmployee_(saValues, sHdr, sLwdIdx) {
+  const empIdx = sHdr['Employee Code'];
+  const refIdx = sHdr['EMI Reference Number'];
+  const decIdx = sHdr['HR Decision'];
+
+  const byEmp = {};
+  for (let r = 1; r < saValues.length; r++) {
+    const row = saValues[r];
+    const ref = String(row[refIdx] || '').trim();
+    if (!ref) continue;
+    const empCode = String(row[empIdx] || '').trim();
+    if (!empCode) continue;
+
+    const decision = String(row[decIdx] || '').trim().toUpperCase();
+    const lwdRaw   = sLwdIdx == null ? '' : row[sLwdIdx];
+    const lwdKey   = (lwdRaw instanceof Date) ? String(lwdRaw.getTime()) : String(lwdRaw || '').trim();
+    const lwdLabel = (lwdRaw instanceof Date)
+      ? Utilities.formatDate(lwdRaw, Session.getScriptTimeZone(), 'dd-MMM-yyyy')
+      : (lwdRaw === '' || lwdRaw == null ? '(blank)' : String(lwdRaw));
+
+    const key = empCode.toUpperCase();
+    if (!byEmp[key]) byEmp[key] = { empCode, rows: [] };
+    byEmp[key].rows.push({ ref, decision, lwdKey, lwdLabel });
+  }
+
+  const problems = [];
+  Object.keys(byEmp).forEach(key => {
+    const rows = byEmp[key].rows;
+
+    // Conflict checks need two rows to compare. The Last Working Day requirement below does
+    // NOT — it applies to anyone marked RESIGNED, one advance or several. Gating the whole
+    // function on rows.length >= 2 meant a single-advance resignation could pass with no
+    // date at all, which is the one input the settlement cycle cannot work without.
+    if (rows.length >= 2) {
+      const decisions = {};
+      rows.forEach(r => { decisions[r.decision] = (decisions[r.decision] || []).concat(r.ref); });
+
+      if (Object.keys(decisions).length > 1) {
+        const parts = Object.keys(decisions).map(d => `${d || '(blank)'} on ${decisions[d].join(', ')}`);
+        problems.push(`${byEmp[key].empCode}: conflicting HR Decision — ${parts.join(' vs ')}`);
+        return; // decision itself is broken; don't also report LWD noise on top of it
+      }
+    }
+
+    // Last Working Day is only mandatory-and-must-match when the (now
+    // confirmed consistent) decision is RESIGNED. ABSCOND/SKIP/blank never
+    // require it — matches the sheet's own Alert rule, which only errors
+    // on RESIGNED with a blank Last Working Day.
+    if (rows[0].decision !== 'RESIGNED') return;
+
+    const blankRefs = rows.filter(r => r.lwdKey === '').map(r => r.ref);
+    if (blankRefs.length) {
+      problems.push(
+        `${byEmp[key].empCode}: RESIGNED but Last Working Day is blank on ${blankRefs.join(', ')}` +
+        (rows.length > 1 ? ' — must be filled on every row' : '')
+      );
+      return;
+    }
+
+    const lwds = {};
+    rows.forEach(r => { lwds[r.lwdKey] = (lwds[r.lwdKey] || []).concat(r.ref); });
+    if (Object.keys(lwds).length > 1) {
+      const parts = Object.keys(lwds).map(k => {
+        const sample = rows.find(r => r.lwdKey === k);
+        return `${sample.lwdLabel} on ${lwds[k].join(', ')}`;
+      });
+      problems.push(`${byEmp[key].empCode}: conflicting Last Working Day — ${parts.join(' vs ')}`);
+    }
+  });
+
+  if (problems.length) {
+    throw new Error(
+      'Fix in attendance "Salary Advance deductions" before continuing:\n- ' + problems.join('\n- ')
+    );
+  }
+}
+
+/* Update Salary Advance (5A) fully locks this tab once the admin has
+   approved and committed a month — protection description
+   "SALARY_ADVANCE_APPROVAL_LOCK_<month>". Left unguarded, a later
+   Validate Payroll run would silently clear that lock and rebuild the
+   tab (see vpClearApprovalBody_ / vpProtectApprovalTabForEntry_), which
+   can retroactively invalidate an already-approved amount — Advance
+   Deduction written by 5A shifts PAY_ROLL!Total Earnings, which can cross
+   a Professional Tax slab and change Max Recoverable out from under a
+   figure the admin already locked in.
+
+   So once locked for the current month, this refuses to proceed UNLESS
+   Get Payroll Data has genuinely been re-run since that lock — checked
+   via the GET_PAYROLL_DATA_LAST_RUN Script Property file 2 stamps on
+   every successful completion. That turns "revalidate after something
+   legitimately changed" into a deliberate two-step action instead of an
+   accidental side effect of re-running this alone. */
+function vpAssertApprovalNotLockedWithoutFreshGetPayrollData_(apSh, payrollMonthLabel) {
+  const lockDescription = `SALARY_ADVANCE_APPROVAL_LOCK_${payrollMonthLabel || ''}`.trim();
+
+  let locked = false;
+  try {
+    locked = apSh.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+      .some(p => String(p.getDescription() || '').trim() === lockDescription);
+  } catch (_) {
+    return; // a protection-read failure must not block a legitimate refresh
+  }
+  if (!locked) return;
+
+  const lastRow = apSh.getLastRow();
+  if (lastRow < 2) return;
+
+  const aHdr = buildHeaderIndexMap_(
+    apSh.getRange(1, 1, 1, apSh.getLastColumn()).getDisplayValues()[0].map(h => String(h || '').trim())
+  );
+  const updIdx = aHdr['Updated On'];
+  if (updIdx == null) return;
+
+  const stampValues = apSh.getRange(2, updIdx + 1, lastRow - 1, 1).getDisplayValues();
+  let stamp = '';
+  for (let i = 0; i < stampValues.length; i++) {
+    const v = String(stampValues[i][0] || '').trim();
+    if (v) { stamp = v; break; }
+  }
+  if (!stamp) return; // locked but no stamp found — unexpected shape, don't block on it
+
+  const lockTimePart = stamp.split('|')[1] ? stamp.split('|')[1].trim() : '';
+  const lockTime      = lockTimePart ? new Date(lockTimePart.replace(' ', 'T')) : null;
+
+  const gpdRunStr  = PropertiesService.getScriptProperties().getProperty('GET_PAYROLL_DATA_LAST_RUN');
+  const gpdRunTime = gpdRunStr ? new Date(gpdRunStr.replace(' ', 'T')) : null;
+
+  if (lockTime && !isNaN(lockTime) && gpdRunTime && !isNaN(gpdRunTime) && gpdRunTime.getTime() > lockTime.getTime()) {
+    return; // Get Payroll Data was genuinely re-run since the lock — deliberate revalidation
+  }
+
+  throw new Error(
+    `Salary Advance Approval is already locked (Updated On: ${stamp}). To legitimately ` +
+    're-validate, run "Get Payroll Data" again first, then run Validate Payroll.'
+  );
+}
+
+function vpPopulateSalaryAdvanceApproval_(ss, meta, payrollSh, pHdr, payrollMonthLabel) {
+  const APPROVAL_TAB = 'Salary Advance Approval';
+  const SA_TAB       = 'Salary Advance deductions';
+
+  const apSh = ss.getSheetByName(APPROVAL_TAB);
+  if (!apSh) throw new Error(`Tab not found: ${APPROVAL_TAB}`);
+
+  // ---- Refuse to silently unlock an already-approved, already-locked month ----
+  vpAssertApprovalNotLockedWithoutFreshGetPayrollData_(apSh, payrollMonthLabel);
+
+  // No unprotect step is needed. Every script path here runs as pmo@ — either
+  // directly, or through the Web App deployed "Execute as: Me" — and a Sheets
+  // protection never restricts the owner. Protection exists to stop the admin
+  // typing in the wrong column, not to stop the script writing.
+
+  // ---- Attendance file ----
+  const attendanceFileId = String(meta['ATTENDANCE_FILE_ID'] || '').trim();
+  if (!attendanceFileId) throw new Error('META_DATA -> ATTENDANCE_FILE_ID is empty.');
+
+  const attSS = SpreadsheetApp.openById(extractSpreadsheetId_(attendanceFileId));
+  const saSh  = attSS.getSheetByName(SA_TAB);
+  if (!saSh) throw new Error(`Attendance tab not found: ${SA_TAB}`);
+
+  // ---- Source rows from the attendance deductions tab ----
+  const saValues = saSh.getDataRange().getValues();
+  if (saValues.length < 2) {
+    vpClearApprovalBody_(apSh);
+    return { message: 'Salary Advance Approval: no EMI rows this month.' };
+  }
+
+  const sHdr = buildHeaderIndexMap_(saValues[0].map(h => String(h || '').trim()));
+  ['Month', 'Employee Code', 'Name', 'Department', 'EMI Reference Number',
+   'EMI Amount', 'Current Balance', 'HR Decision'].forEach(h => {
+    if (sHdr[h] == null) throw new Error(`"${SA_TAB}" is missing header: ${h}`);
+  });
+  // These two are new; tolerate their absence on an older month's file.
+  const sStageIdx = sHdr['Settlement Stage'];
+  const sLwdIdx   = sHdr['Last Working Day'];
+
+  // ---- Employee-level consistency: HR Decision and Last Working Day must
+  // agree across every EMI row an employee has this month, or nothing is
+  // written. Thrown here, before vpClearApprovalBody_ runs, so a conflict
+  // leaves the approval tab exactly as it was rather than wiping it first.
+  vpAssertSalaryAdvanceRowsConsistentPerEmployee_(saValues, sHdr, sLwdIdx);
+
+  // ---- Max Recoverable, per employee, from PAY_ROLL ----
+  const maxRecoverableByEmp = vpBuildMaxRecoverableMap_(payrollSh, pHdr);
+
+  // ---- Payable days, per employee, from Attendance entry ----
+  const payableDaysByEmp = vpBuildPayableDaysMap_(attSS);
+
+  // ---- Times skipped, per EMI reference, from EMI_SCHEDULE history ----
+  const timesSkippedByRef = vpBuildTimesSkippedMap_();
+
+  // ---- Existing admin entries, to preserve ----
+  const aHdr = buildHeaderIndexMap_(
+    apSh.getRange(1, 1, 1, apSh.getLastColumn()).getDisplayValues()[0].map(h => String(h || '').trim())
+  );
+  ['Month', 'Employee Code', 'Name', 'Department', 'EMI Reference Number',
+   'EMI Amount', 'Current Balance', 'Settlement Stage', 'Last Working Day',
+   'Times Skipped', 'Payable Days', 'Max Recoverable', 'HR Decision (from HR)',
+   'Approved Decision', 'Entry Mode', 'Admin Entry', 'Updated On'].forEach(h => {
+    if (aHdr[h] == null) throw new Error(`"${APPROVAL_TAB}" is missing header: ${h}`);
+  });
+
+  const keptEntries = vpReadExistingApprovalEntries_(apSh, aHdr);
+
+  // ---- Build the merged rows ----
+  const out = [];
+  for (let r = 1; r < saValues.length; r++) {
+    const row = saValues[r];
+    const ref = String(row[sHdr['EMI Reference Number']] || '').trim();
+    if (!ref) continue;
+
+    const empCode = String(row[sHdr['Employee Code']] || '').trim();
+    if (!empCode) continue;
+
+    const key  = empCode.toUpperCase() + '||' + ref.toUpperCase();
+    const kept = keptEntries[key] || { approved: '', mode: '', entry: '' };
+
+    out.push({
+      month:        row[sHdr['Month']],
+      empCode:      empCode,
+      name:         row[sHdr['Name']],
+      dept:         row[sHdr['Department']],
+      ref:          ref,
+      emiAmount:    row[sHdr['EMI Amount']],
+      currBalance:  row[sHdr['Current Balance']],
+      stage:        sStageIdx == null ? '' : row[sStageIdx],
+      lwd:          sLwdIdx   == null ? '' : row[sLwdIdx],
+      timesSkipped: timesSkippedByRef[ref.toUpperCase()] || 0,
+      payableDays:  payableDaysByEmp[empCode.toUpperCase()],
+      maxRecover:   maxRecoverableByEmp[empCode.toUpperCase()],
+      hrDecision:   row[sHdr['HR Decision']],
+      approved:     kept.approved,
+      mode:         kept.mode,
+      entry:        kept.entry,
+    });
+  }
+
+  // ---- Sort: HR Decision present first, then Employee Code, then EMI
+  // Reference Number (numeric-aware) ---- so employees HR has already
+  // acted on float to the top and the admin isn't hunting the whole sheet
+  // for them, while still landing an employee's own EMI rows together.
+  // Safe to key on HR Decision alone: the consistency check earlier in
+  // this file already guarantees every one of an employee's rows carries
+  // the same value, so this can never split one employee's rows apart.
+  out.sort((a, b) => {
+    const aHasDecision = String(a.hrDecision || '').trim() ? 0 : 1;
+    const bHasDecision = String(b.hrDecision || '').trim() ? 0 : 1;
+    if (aHasDecision !== bHasDecision) return aHasDecision - bHasDecision;
+
+    if (a.empCode < b.empCode) return -1;
+    if (a.empCode > b.empCode) return 1;
+    return vpRefNumber_(a.ref) - vpRefNumber_(b.ref);
+  });
+
+  // ---- Write ----
+  vpClearApprovalBody_(apSh);
+  if (!out.length) {
+    return { message: 'Salary Advance Approval: no EMI rows this month.' };
+  }
+
+  const colWrites = {
+    'Month':                 out.map(o => [o.month]),
+    'Employee Code':         out.map(o => [o.empCode]),
+    'Name':                  out.map(o => [o.name]),
+    'Department':            out.map(o => [o.dept]),
+    'EMI Reference Number':  out.map(o => [o.ref]),
+    'EMI Amount':            out.map(o => [o.emiAmount]),
+    'Current Balance':       out.map(o => [o.currBalance]),
+    'Settlement Stage':      out.map(o => [o.stage]),
+    'Last Working Day':      out.map(o => [o.lwd]),
+    'Times Skipped':         out.map(o => [o.timesSkipped]),
+    'Payable Days':          out.map(o => [o.payableDays == null ? '' : o.payableDays]),
+    'Max Recoverable':       out.map(o => [o.maxRecover  == null ? '' : o.maxRecover]),
+    'HR Decision (from HR)': out.map(o => [o.hrDecision]),
+    'Approved Decision':     out.map(o => [o.approved]),
+    'Entry Mode':            out.map(o => [o.mode]),
+    'Admin Entry':           out.map(o => [o.entry]),
+  };
+
+  Object.keys(colWrites).forEach(h => {
+    apSh.getRange(2, aHdr[h] + 1, out.length, 1).setValues(colWrites[h]);
+  });
+
+  // Updated On stays cleared by vpClearApprovalBody_ — any refresh
+  // invalidates a previous approval, which is what makes the
+  // timestamp guard on Generate Locked Payroll sufficient.
+
+  // ---- Re-open the three entry columns; everything else stays protected ----
+  vpProtectApprovalTabForEntry_(apSh, aHdr, payrollMonthLabel);
+
+  const keptCount    = out.filter(o => o.entry !== '' || o.approved !== '').length;
+  const missingMaxRc = out.filter(o => o.maxRecover == null).length;
+
+  let message = `Salary Advance Approval refreshed: ${out.length} EMI row(s), ` +
+                `${keptCount} existing entr(ies) preserved.`;
+  if (missingMaxRc) {
+    message += `\nNOTE: ${missingMaxRc} row(s) have no Max Recoverable — ` +
+               `those employees are not in PAY_ROLL.`;
+  }
+  message += '\nApproval timestamp cleared — run "Update Salary Advance Recovered Amount" again.';
+
+  return { message };
+}
+
+/* ---- Max Recoverable, per employee, computed from PAY_ROLL ----
+   Deliberately re-reads PAY_ROLL with getValues() rather than reusing the
+   caller's getDisplayValues() array. toNumber_ strips commas but not a
+   currency symbol, so a "₹22,000.00" display string would parse as NaN and
+   fall back to 0 — silently zeroing every Max Recoverable. Raw values are
+   immune to whatever number format the column happens to carry. */
+function vpBuildMaxRecoverableMap_(payrollSh, pHdr) {
+  const need = ['Employee Code', 'Total Earnings', 'Advance Deduction',
+                'Total Deductions', 'Other Payments [Net]'];
+  need.forEach(h => {
+    if (pHdr[h] == null) throw new Error(`PAY_ROLL is missing header: ${h}`);
+  });
+
+  const map     = {};
+  const lastRow = payrollSh.getLastRow();
+  if (lastRow < 2) return map;
+
+  const raws = payrollSh.getRange(2, 1, lastRow - 1, payrollSh.getLastColumn()).getValues();
+
+  const num = (v) => {
+    if (v === '' || v == null) return 0;
+    const n = (typeof v === 'number') ? v : Number(String(v).replace(/,/g, '').trim());
+    return isNaN(n) ? 0 : n;
+  };
+
+  for (let r = 0; r < raws.length; r++) {
+    const row     = raws[r];
+    const empCode = String(row[pHdr['Employee Code']] || '').trim();
+    if (!empCode) continue;
+
+    const totalEarnings = num(row[pHdr['Total Earnings']]);
+    const advDeduction  = num(row[pHdr['Advance Deduction']]);
+    const totalDeduct   = num(row[pHdr['Total Deductions']]);
+    const otherNet      = num(row[pHdr['Other Payments [Net]']]);
+
+    // "+ advDeduction" cancels the subtraction already inside Total Earnings,
+    // which is what makes this figure independent of the deduction column.
+    const raw = (totalEarnings + advDeduction) - totalDeduct + otherNet;
+    map[empCode.toUpperCase()] = raw > 0 ? raw : 0;
+  }
+  return map;
+}
+
+/* ---- Payable days, per employee, from the attendance file ---- */
+function vpBuildPayableDaysMap_(attSS) {
+  const sh = attSS.getSheetByName('Attendance entry');
+  if (!sh) return {};
+
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const hdr = buildHeaderIndexMap_(values[0].map(h => String(h || '').trim()));
+  const empIdx  = hdr['Employee Code'];
+  const daysIdx = hdr['FINAL PAYABLE DAYS'];
+  if (empIdx == null || daysIdx == null) return {};
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const empCode = String(values[r][empIdx] || '').trim();
+    if (!empCode) continue;
+    map[empCode.toUpperCase()] = toNumber_(values[r][daysIdx]);
+  }
+  return map;
+}
+
+/* ---- How many times this EMI reference has already been skipped ----
+   Sourced from EMI_SCHEDULE history, not from the SKIP_EXTENDED_V4
+   ScriptProperties keys — those are only an idempotency guard and are
+   not queryable data. */
+function vpBuildTimesSkippedMap_() {
+  const map = {};
+  try {
+    const masterId = '172uLkW5v1Dr_fYO8rZ3GaAwYEyYyRc_n0PaVYjHDwUg';
+    const sh = SpreadsheetApp.openById(masterId).getSheetByName('EMI_SCHEDULE');
+    if (!sh) return map;
+
+    const values = sh.getDataRange().getValues();
+    if (values.length < 2) return map;
+
+    const hdr = buildHeaderIndexMap_(values[0].map(h => String(h || '').trim()));
+    const refIdx = hdr['EMI Reference Number'];
+    const decIdx = hdr['HR Decision'];
+    if (refIdx == null || decIdx == null) return map;
+
+    for (let r = 1; r < values.length; r++) {
+      const ref = String(values[r][refIdx] || '').trim().toUpperCase();
+      if (!ref) continue;
+      if (String(values[r][decIdx] || '').trim().toUpperCase() !== 'SKIP') continue;
+      map[ref] = (map[ref] || 0) + 1;
+    }
+  } catch (_) {
+    // A history read failing must not block the approval refresh.
+  }
+  return map;
+}
+
+/* ---- Read back what the admin already entered, keyed emp||ref ---- */
+function vpReadExistingApprovalEntries_(apSh, aHdr) {
+  const kept    = {};
+  const lastRow = apSh.getLastRow();
+  if (lastRow < 2) return kept;
+
+  const values = apSh.getRange(2, 1, lastRow - 1, apSh.getLastColumn()).getValues();
+  for (let i = 0; i < values.length; i++) {
+    const row     = values[i];
+    const empCode = String(row[aHdr['Employee Code']] || '').trim();
+    const ref     = String(row[aHdr['EMI Reference Number']] || '').trim();
+    if (!empCode || !ref) continue;
+
+    const approved = String(row[aHdr['Approved Decision']] || '').trim();
+    const mode     = String(row[aHdr['Entry Mode']] || '').trim();
+    const entryRaw = row[aHdr['Admin Entry']];
+    const entry    = (entryRaw === '' || entryRaw == null) ? '' : entryRaw;
+
+    if (approved === '' && mode === '' && entry === '') continue;
+
+    kept[empCode.toUpperCase() + '||' + ref.toUpperCase()] = { approved, mode, entry };
+  }
+  return kept;
+}
+
+/* ---- Clear only the script-managed and input columns.
+   Formula columns are never touched. ---- */
+function vpClearApprovalBody_(apSh) {
+  const lastRow = apSh.getMaxRows();
+  if (lastRow < 2) return;
+
+  const aHdr = buildHeaderIndexMap_(
+    apSh.getRange(1, 1, 1, apSh.getLastColumn()).getDisplayValues()[0].map(h => String(h || '').trim())
+  );
+
+  const clearHeaders = [
+    'Month', 'Employee Code', 'Name', 'Department', 'EMI Reference Number',
+    'EMI Amount', 'Current Balance', 'Settlement Stage', 'Last Working Day',
+    'Times Skipped', 'Payable Days', 'Max Recoverable', 'HR Decision (from HR)',
+    'Approved Decision', 'Entry Mode', 'Admin Entry', 'Updated On',
+  ];
+
+  clearHeaders.forEach(h => {
+    const idx = aHdr[h];
+    if (idx == null) return;
+    apSh.getRange(2, idx + 1, lastRow - 1, 1).clearContent();
+  });
+}
+
+/* ---- Protect the tab, leaving only the three entry columns open ----
+   The admin can type in Approved Decision / Entry Mode / Admin Entry and
+   nowhere else, so a formula or a script-written figure cannot be
+   overwritten by accident. Unprotected ranges are excluded from the
+   protection entirely, so nazneen@ can edit them without being added as
+   an editor of the protection itself.
+
+   Scripts are unaffected either way — they run as pmo@, and a protection
+   never restricts the owner. The "Update Salary Advance Recovered Amount"
+   button later replaces this with a full lock, which is what the timestamp
+   guard on Generate Locked Payroll relies on. */
+function vpProtectApprovalTabForEntry_(apSh, aHdr, monthLabel) {
+  const ENTRY_HEADERS = ['Approved Decision', 'Entry Mode', 'Admin Entry'];
+
+  try {
+    apSh.getProtections(SpreadsheetApp.ProtectionType.SHEET)
+        .forEach(p => { try { p.remove(); } catch (_) {} });
+  } catch (_) {}
+
+  const lastRow = Math.max(apSh.getMaxRows(), 2);
+
+  try {
+    const protection = apSh.protect();
+    protection.setDescription(`SALARY_ADVANCE_APPROVAL_ENTRY_${monthLabel || ''}`.trim());
+    protection.setWarningOnly(false);
+
+    const open = [];
+    ENTRY_HEADERS.forEach(h => {
+      const idx = aHdr[h];
+      if (idx == null) return;
+      open.push(apSh.getRange(2, idx + 1, lastRow - 1, 1));
+    });
+    if (open.length) protection.setUnprotectedRanges(open);
+
+    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    try { protection.addEditors([VP_OWNER_EMAIL]); } catch (_) {}
+    try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
+  } catch (_) {
+    // Protection is a convenience, not a correctness guarantee — never let it
+    // fail the refresh that has already written correctly.
+  }
 }
 
 /* =========================================================
