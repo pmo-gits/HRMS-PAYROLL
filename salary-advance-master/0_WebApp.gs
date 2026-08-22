@@ -21,8 +21,38 @@ const SALARY_ADVANCE_MASTER_SPREADSHEET_ID =
 const EMI_WEBAPP_URL =
   "https://script.google.com/macros/s/AKfycbxopXmcqaaDy3AhLCHoC8RU6OfuzOJ70fwv6LjFrd5YqkZzAZ6lroz_-XoIESLMt0Ehxg/exec";
 
-const EMI_PMO_USER_     = "pmo@butlerleather.com";
-const EMI_ALLOWED_USER_ = "nazneen@butlerleather.com";
+const EMI_PMO_USER_       = "pmo@butlerleather.com";
+const EMI_ALLOWED_USER_   = "nazneen@butlerleather.com";
+const EMI_HR_ASSIST_USER_ = "hrassist@butlerleather.com";
+
+/**
+ * Who may call which action, keyed by action name.
+ *
+ * Authorisation used to be a single check — "are you nazneen@?" — applied to
+ * every action alike. hrassist@ needs TWO of them (removeRequestRows, so HR can
+ * withdraw their own un-scheduled requests past the sheet protection, and
+ * syncEmpMaster, so they can refresh the mirror themselves) and must NOT gain
+ * scheduleEMI or cancelEMI along the way. A flat second allowed-user constant
+ * would have handed over all five.
+ *
+ * Note what hrassist@ deliberately does NOT get: syncSalaryMaster. Refreshing
+ * SALARY master moves the ceiling the eligibility gate enforces, so it stays
+ * with pmo@/nazneen@ — the people who own the limit, not the people who request
+ * against it.
+ *
+ * FAIL-CLOSED: an action absent from this map is denied. Adding a new action to
+ * the switch below therefore denies everyone until it is listed here too, which
+ * is the right way round — a forgotten entry blocks work, it does not expose it.
+ * pmo@ never appears here: the owner never reaches the Web App, running Core
+ * directly from the menu instead.
+ */
+const EMI_ACTION_ALLOWED_ = {
+  scheduleEMI:       [EMI_ALLOWED_USER_],
+  cancelEMI:         [EMI_ALLOWED_USER_],
+  syncEmpMaster:     [EMI_ALLOWED_USER_, EMI_HR_ASSIST_USER_],
+  syncSalaryMaster:  [EMI_ALLOWED_USER_],
+  removeRequestRows: [EMI_ALLOWED_USER_, EMI_HR_ASSIST_USER_],
+};
 
 /**
  * forceEmailScope_EMI_
@@ -43,12 +73,20 @@ function doPost(e) {
   try {
     const payload     = JSON.parse(e.postData.contents);
     const requestedBy = String(payload.requestedBy || "").trim().toLowerCase();
+    const action      = String(payload.action || "").trim();
 
-    if (requestedBy !== EMI_ALLOWED_USER_) {
+    // Authorisation is now PER ACTION — see EMI_ACTION_ALLOWED_ above. The
+    // action is resolved first so the check can be specific to it; an unknown
+    // action has no entry, so it is denied here before ever reaching the
+    // switch. Denials stay deliberately vague about which of the two reasons
+    // applied.
+    const allowed = Object.prototype.hasOwnProperty.call(EMI_ACTION_ALLOWED_, action)
+      ? EMI_ACTION_ALLOWED_[action]
+      : [];
+
+    if (allowed.indexOf(requestedBy) === -1) {
       return emiJsonResponse_(false, "Access denied. You are not authorised to call this Web App.");
     }
-
-    const action = String(payload.action || "").trim();
 
     switch (action) {
       case "scheduleEMI":
@@ -57,6 +95,10 @@ function doPost(e) {
         return cancelEMIServer_(payload);
       case "syncEmpMaster":
         return syncEmpMasterServer_(payload);
+      case "syncSalaryMaster":
+        return syncSalaryMasterServer_(payload);
+      case "removeRequestRows":
+        return removeRequestRowsServer_(payload);
       default:
         return emiJsonResponse_(false, `Unknown action: "${action}"`);
     }
@@ -93,11 +135,25 @@ function scheduleEMIServer_(payload) {
 
     const ss              = SpreadsheetApp.openById(ssId);
     const allowExceptions = Array.isArray(payload.allowExceptions) ? payload.allowExceptions : [];
-    const result          = scheduleEMI_Core_(ss, allowExceptions);
+
+    // ✅ NEW (v6) — tenure-override list, relayed exactly like allowExceptions.
+    // There is intentionally NO payload field for amount failures: those are
+    // not overridable, so no request can ask for one.
+    const allowTenureExceptions = Array.isArray(payload.allowTenureExceptions)
+      ? payload.allowTenureExceptions : [];
+
+    // requestedBy has already been validated against EMI_ALLOWED_USER_ in
+    // doPost. It is forwarded so the override stamp names the person who
+    // actually clicked — this Web App executes as the owner, so reading the
+    // effective user inside Core would stamp pmo@ for every delegate override.
+    const result = scheduleEMI_Core_(
+      ss, allowExceptions, allowTenureExceptions, String(payload.requestedBy || "").trim()
+    );
 
     return emiJsonResponse_(result.success, result.message, {
-      refsCreated: result.refsCreated || 0,
-      rowsAdded:   result.rowsAdded   || 0,
+      refsCreated:       result.refsCreated       || 0,
+      rowsAdded:         result.rowsAdded         || 0,
+      skippedIneligible: result.skippedIneligible || 0,
     });
 
   } catch (err) {
@@ -152,6 +208,62 @@ function syncEmpMasterServer_(payload) {
     );
   } catch (err) {
     return emiJsonResponse_(false, "syncEmpMaster failed: " + err.message);
+  }
+}
+
+/**
+ * syncSalaryMaster server handler
+ * Requires: spreadsheetId, requestedBy in payload.
+ * Core logic is UI-free in 4_SalaryMasterSync.gs. Unlike syncEmpMaster_Core_,
+ * it takes ss explicitly rather than calling getActiveSpreadsheet() — there is
+ * no active spreadsheet in a Web App request, and relying on the binding would
+ * make the function untestable from anywhere else.
+ */
+function syncSalaryMasterServer_(payload) {
+  try {
+    const ssId = String(payload.spreadsheetId || "").trim();
+    if (!ssId) return emiJsonResponse_(false, "Missing spreadsheetId.");
+
+    const result = syncSalaryMaster_Core_(SpreadsheetApp.openById(ssId));
+    return emiJsonResponse_(result.success, result.message, {
+      written:    result.written || 0,
+      duplicates: (result.duplicates || []).length,
+    });
+  } catch (err) {
+    return emiJsonResponse_(false, "syncSalaryMaster failed: " + err.message);
+  }
+}
+
+/**
+ * removeRequestRows server handler
+ * Requires: spreadsheetId, requestedBy, rowNumbers in payload.
+ *
+ * The selection was resolved to row numbers CLIENT-side (getActiveRangeList
+ * does not exist in a Web App request). Those numbers are treated as a
+ * suggestion, not an instruction: removeRequestRows_Core_ re-reads every one of
+ * them from the sheet and re-applies the full validation before deleting
+ * anything, so a stale or hand-edited payload cannot remove a scheduled row.
+ *
+ * requestedBy is forwarded for the removal log — this Web App executes as the
+ * owner, so reading the effective user inside Core would record pmo@ for every
+ * delegate deletion.
+ */
+function removeRequestRowsServer_(payload) {
+  try {
+    const ssId = String(payload.spreadsheetId || "").trim();
+    if (!ssId) return emiJsonResponse_(false, "Missing spreadsheetId.");
+
+    const rowNumbers = Array.isArray(payload.rowNumbers) ? payload.rowNumbers : [];
+    if (rowNumbers.length === 0) return emiJsonResponse_(false, "No rows were selected.");
+
+    const ss     = SpreadsheetApp.openById(ssId);
+    const result = removeRequestRows_Core_(
+      ss, rowNumbers, String(payload.requestedBy || "").trim()
+    );
+
+    return emiJsonResponse_(result.success, result.message, { removed: result.removed || 0 });
+  } catch (err) {
+    return emiJsonResponse_(false, "removeRequestRows failed: " + err.message);
   }
 }
 

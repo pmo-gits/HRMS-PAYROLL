@@ -83,6 +83,39 @@
  *      skips any reference already marked CANCELLED, so a stale ledger entry can never flip a
  *      cancelled reference's rows back to WRITE OFF/CLOSED on a later scheduled run.
  *
+ * ✅ NEW (v6) — advance-eligibility gate before anything is scheduled.
+ *    Logic lives in 5_AdvanceEligibility.gs; this file only calls it and
+ *    reports the result. Two rules, deliberately with different politics:
+ *
+ *      AMOUNT — Advance Amount + the employee's existing ACTIVE advance
+ *               balances must not exceed his NET SALARY (from the new
+ *               "SALARY master" tab, see 4_SalaryMasterSync.gs).
+ *               NOT OVERRIDABLE — there is no parameter, payload field or
+ *               dialog answer anywhere in this module that can schedule
+ *               one of these. The row is skipped and named; every other
+ *               eligible row in the same run still schedules.
+ *
+ *      TENURE — D.O.J + 1 year must have been reached as of TODAY
+ *               (D.O.J from the local "EMP master" mirror; the test is
+ *               "today", matching the ledger's Eligibility Status formula
+ *               so HR's screen and this gate can never disagree).
+ *               OVERRIDABLE via one combined Yes/No dialog, same shape as
+ *               the v4 duplicate-EMI prompt. An approved override is
+ *               STAMPED onto the ledger row — "Eligibility Override By" /
+ *               "Eligibility Override On" — so an exception to a financial
+ *               limit is never anonymous.
+ *
+ *    The gate RECOMPUTES everything from source. Advance Ledger's
+ *    "Eligible Amount" / "Eligibility Status" formula columns exist so HR
+ *    sees the ceiling while typing; they are guidance and are never read
+ *    by this code. A formula cell can be stale, pasted over, or sitting on
+ *    an error, and none of that may decide whether money is released.
+ *
+ * ✅ ALSO FIXED (v6) — two hardcoded Advance Ledger ranges that do not
+ *    auto-adjust when columns are inserted: the Current Balance seed
+ *    formula (was N:P, already stale before this change) and the
+ *    protection width in refreshEmiScheduleProtection_ (was 12 columns).
+ *
  * ✅ Constants EMI_PMO_USER_, EMI_ALLOWED_USER_, EMI_WEBAPP_URL
  *    declared in 0_WebApp.gs — referenced here directly.
  *
@@ -112,12 +145,23 @@ const EMI_SCHEDULE_PROTECTION_DESC = "EMI_SCHEDULE_PROTECTION";
  * This formula references:
  * - E column = EMI Reference Number
  * - H column = Status
- * - Advance Ledger N:P VLOOKUP balance column
+ * - Advance Ledger Q:S VLOOKUP — Q = EMI Reference Number, S = Balance Amount
+ *
+ * ⚠️ These are HARDCODED A1 ranges and do NOT auto-adjust when columns are
+ * inserted on Advance Ledger (Sheets only rewrites formulas that are already
+ * live in a cell — this one is a string in code until it is written).
+ *
+ * FIXED (v6): this constant read 'Advance Ledger'!N:P, which was already stale
+ * against the live sheet's O:Q before the eligibility columns were inserted at
+ * I, and is Q:S after. It only fires when EMI_SCHEDULE has zero data rows, so
+ * it had never actually run — but had it, every Current Balance would have
+ * looked up the wrong three columns and the whole settlement cycle reads that
+ * value. Re-check this line any time Advance Ledger gains or loses a column.
  *
  * If your columns differ in the future, we can convert this to header-based formula.
  */
 const EMI_SCHEDULE_CURRENT_BALANCE_FORMULA =
-  '=ARRAYFORMULA(IF(E2:E="","",IF(H2:H="CANCELLED","",IFNA(VLOOKUP(E2:E,\'Advance Ledger\'!N:P,3,FALSE),""))))';
+  '=ARRAYFORMULA(IF(E2:E="","",IF(H2:H="CANCELLED","",IFNA(VLOOKUP(E2:E,\'Advance Ledger\'!Q:S,3,FALSE),""))))';
 
 /* ================================================
  * onOpen — builds menus
@@ -128,6 +172,10 @@ function onOpen() {
     .addItem("Schedule EMI (create schedule for new advances)", "scheduleEMI_FromAdvanceLedger")
     .addSeparator()
     .addItem("Cancel EMI (by EMI Reference)", "cancelEMI_ByReference")
+    .addSeparator()
+    // ✅ NEW (v6) — handler lives in 6_RemoveRequestRows.gs; all files in this
+    // project share one global scope, so no import is needed.
+    .addItem("Remove Request Rows (selected)", "removeRequestRows_FromSelection")
     .addToUi();
 
   // ✅ Builds the Master menu (defined in 2_EmpMasterSync.gs)
@@ -190,23 +238,68 @@ function scheduleEMI_FromAdvanceLedger() {
     return;
   }
 
+  // ✅ NEW (v6) — eligibility pre-check. Also read-only, also safe for both
+  // users. Two rules with deliberately different politics:
+  //   AMOUNT  → shown for acknowledgement only. There is no Yes/No here and
+  //             no payload field that could carry an override, so no dialog
+  //             answer and no crafted request can get one of these scheduled.
+  //   TENURE  → a real Yes/No, because "he has not finished a year" is a
+  //             policy call somebody is entitled to make, unlike "this is
+  //             more money than he can repay".
+  let allowTenureExceptions = [];
+  try {
+    const elig = advElig_FindIssues_(ss);
+
+    // NOTE: amount / missing-record failures raise NO dialog here on purpose.
+    // They are not overridable, so there is nothing to ask before the run, and
+    // scheduleEMI_Core_ already names every one of them — with the arithmetic —
+    // in the result message. Alerting here as well showed the identical list in
+    // two consecutive dialogs, which reads as the run having happened twice.
+    // The tenure prompt below stays, because that one is a real decision and
+    // must be answered BEFORE anything is written.
+
+    if (elig.tenureIssues.length > 0) {
+      const resp = ui.alert(
+        "Employee(s) have not completed 1 year",
+        `The following employee(s) have not completed 1 year of service:\n\n` +
+        `${advElig_FormatTenureBlockers_(elig.tenureIssues)}\n\n` +
+        `Approve a salary advance for them anyway?\n` +
+        `(Approving is recorded on the ledger row against your name.)`,
+        ui.ButtonSet.YES_NO
+      );
+      if (resp === ui.Button.YES) {
+        allowTenureExceptions = elig.tenureIssues.map(x => x.empCode);
+      }
+      // No → list stays empty; those employees are skipped, not the whole run.
+    }
+  } catch (err) {
+    ui.alert("Error checking advance eligibility: " + err.message);
+    return;
+  }
+
+  const requestedBy = Session.getEffectiveUser().getEmail();
+
   if (user === EMI_PMO_USER_) {
     // Owner: run core directly
     try {
-      const result = scheduleEMI_Core_(ss, allowExceptions);
-      ui.alert(result.message);
+      const result = scheduleEMI_Core_(ss, allowExceptions, allowTenureExceptions, requestedBy);
+      advElig_ShowResultDialog_(ui, result.message);
     } catch (err) {
       ui.alert("Error: " + err.message);
     }
     return;
   }
 
-  // nazneen@: route via Web App — allowExceptions travels in payload
+  // nazneen@: route via Web App — both exception lists travel in the payload.
+  // requestedBy is sent explicitly because the Web App runs as the OWNER
+  // ("Execute as: Me"), so Session.getEffectiveUser() on the server side is
+  // pmo@ regardless of who clicked — it would stamp the wrong name on an
+  // override. callEmiWebApp_ already sets requestedBy from the real caller.
   try {
-    const result = callEmiWebApp_("scheduleEMI", ss, { allowExceptions });
-    ui.alert(result.success
+    const result = callEmiWebApp_("scheduleEMI", ss, { allowExceptions, allowTenureExceptions });
+    advElig_ShowResultDialog_(ui, result.success
       ? (result.message || "EMI Schedule created ✅")
-      : ("Error: " + (result.message || "Unknown error from Web App."))
+      : ("Error\n" + (result.message || "Unknown error from Web App."))
     );
   } catch (err) {
     ui.alert("Web App call failed: " + err.message);
@@ -302,9 +395,24 @@ function cancelEMI_ByReference() {
  *     scheduleEMI_FindActiveEmiConflicts_() (used by the menu wrapper for
  *     the pre-check dialog) on what counts as a conflict.
  *
- * Returns: { success, message, refsCreated, rowsAdded }
+ * ✅ NEW (v6) — advance-eligibility gate, see 5_AdvanceEligibility.gs:
+ *   - allowTenureExceptions (array of Employee Codes, default []) — employees
+ *     shown in the "has not completed 1 year" dialog and explicitly approved.
+ *   - requestedBy (string, default = effective user) — stamped onto the ledger
+ *     beside any tenure override. Passed in rather than read here because the
+ *     Web App executes as the owner, so the effective user is pmo@ no matter
+ *     who actually clicked.
+ *   - AMOUNT failures have NO allow-list parameter, by design. There is no
+ *     argument, payload field or dialog answer that can schedule an advance
+ *     exceeding the employee's net salary; the row is always skipped.
+ *   - Both parameters are trailing and optional, so an older deployed Web App
+ *     calling scheduleEMI_Core_(ss, allowExceptions) still gates correctly —
+ *     it simply approves no tenure exceptions, which SKIPS those employees.
+ *     Fail-closed: a stale caller refuses money, it never releases it.
+ *
+ * Returns: { success, message, refsCreated, rowsAdded, skippedIneligible }
  */
-function scheduleEMI_Core_(ss, allowExceptions) {
+function scheduleEMI_Core_(ss, allowExceptions, allowTenureExceptions, requestedBy) {
 
   const ledger   = ss.getSheetByName(ADV_LEDGER_SHEET);
   const schedule = ss.getSheetByName(EMI_SCHEDULE_SHEET);
@@ -368,6 +476,34 @@ function scheduleEMI_Core_(ss, allowExceptions) {
   const skipSet   = new Set(conflicts.filter(c => !allowSet.has(c.empCode)).map(c => c.empCode));
   const skippedActiveEmi = conflicts.filter(c => skipSet.has(c.empCode));
 
+  // ✅ NEW (v6) — advance-eligibility gate. Recomputed here from SALARY master,
+  // EMP master and the ledger's own balance columns; the "Eligible Amount" /
+  // "Eligibility Status" formula columns are guidance for HR and are never read.
+  const balIdx0        = opt_(ledMap, "BALANCE AMOUNT");
+  const elig           = advElig_BuildIssues_(ss, ledVals, ledDisp, L, emiStatusIdx0, balIdx0);
+  const allowTenureSet = new Set((allowTenureExceptions || []).map(v => str_(v).toUpperCase()));
+
+  const ineligibleRows     = new Set(); // ledger array indices to skip entirely
+  const tenureOverrideRows = new Set(); // scheduled, but only via an override
+  const skippedAmount      = [];
+  const skippedTenure      = [];
+
+  elig.byRow.forEach((issue, i) => {
+    // Amount / missing-data failures are terminal — no allow-list consulted.
+    if (issue.noSalary || issue.noDoj || issue.amountFail) {
+      ineligibleRows.add(i);
+      skippedAmount.push(issue);
+      return;
+    }
+    // Tenure-only failure — overridable.
+    if (allowTenureSet.has(issue.empCode.toUpperCase())) {
+      tenureOverrideRows.add(i);
+    } else {
+      ineligibleRows.add(i);
+      skippedTenure.push(issue);
+    }
+  });
+
   // ✅ PHASE 1 — Validate ALL eligible rows FIRST before writing anything
   // "Eligible" = has Employee Code + no existing ref + not skipped for active-EMI conflict
   // Any eligible row that fails field validation = abort entire run
@@ -381,6 +517,7 @@ function scheduleEMI_Core_(ss, allowExceptions) {
     if (existingRef) continue; // already scheduled — not eligible, skip silently
 
     if (skipSet.has(empCode)) continue; // ✅ NEW (v4) — active-EMI conflict, not approved
+    if (ineligibleRows.has(i))  continue; // ✅ NEW (v6) — failed the eligibility gate
 
     // ✅ This row IS eligible — validate all required fields strictly
     const advAmount    = num_(row[L.advAmt]);
@@ -415,6 +552,7 @@ function scheduleEMI_Core_(ss, allowExceptions) {
     if (existingRef) continue; // already scheduled
 
     if (skipSet.has(empCode)) continue; // ✅ NEW (v4) — active-EMI conflict, not approved
+    if (ineligibleRows.has(i))  continue; // ✅ NEW (v6) — failed the eligibility gate
 
     const advAmount    = num_(row[L.advAmt]);
     const tenure       = Math.floor(num_(row[L.tenure]));
@@ -465,6 +603,7 @@ function scheduleEMI_Core_(ss, allowExceptions) {
     }
 
     ledgerUpdates.push({
+      i,
       r:           i + 2,
       ref,
       schedStatus: `Scheduled - ${nowStamp}`,
@@ -472,14 +611,35 @@ function scheduleEMI_Core_(ss, allowExceptions) {
   }
 
   // ✅ NEW (v4) — appended to whichever message is returned below, if anyone was skipped
-  const skippedNote = skippedActiveEmi.length > 0
+  let skippedNote = skippedActiveEmi.length > 0
     ? `\n\nSkipped (already have an active EMI, not approved): ${skippedActiveEmi.map(c => `${c.empCode} – ${c.name}`).join(", ")}`
     : "";
 
+  // ✅ NEW (v6) — eligibility skips, reported separately so the reason is never
+  // ambiguous. Amount failures are listed with the arithmetic behind them,
+  // because "not eligible" alone is not something HR can act on.
+  if (skippedAmount.length > 0) {
+    skippedNote += `\n\n${advElig_AmountBlockerSection_(skippedAmount)}`;
+  }
+  if (skippedTenure.length > 0) {
+    skippedNote += `\n\nSkipped — under 1 year of service, not approved:\n` +
+      advElig_FormatTenureBlockers_(skippedTenure);
+  }
+
   if (ledgerUpdates.length === 0) {
+    // The required-fields checklist is shown ONLY when nothing was skipped for a
+    // stated reason. Printing it beneath an eligibility refusal was actively
+    // misleading — those rows were complete, and it sent HR to check Tenure and
+    // Advance Paid Month when the real problem was the Advance Amount.
+    const anySkips = skippedActiveEmi.length + skippedAmount.length + skippedTenure.length > 0;
+    const preamble = anySkips ? "" :
+      "\n\nNo pending advance rows were ready to schedule.\n" +
+      "(Required: Status=ACTIVE, Advance Amount, Advance Paid Month,\n" +
+      " EMI Start Month, Tenure)";
+
     return {
       success: false,
-      message: "No new eligible advances found to schedule.\n(Required: Status=ACTIVE, Advance Amount, Advance Paid Month, EMI Start Month, Tenure)" + skippedNote,
+      message: "No EMI scheduled." + preamble + skippedNote,
     };
   }
 
@@ -492,14 +652,39 @@ function scheduleEMI_Core_(ss, allowExceptions) {
     ledger.getRange(u.r, L.schedStatus + 1).setValue(u.schedStatus);
   });
 
-  // ✅ Recreate single bulk protection on EMI_SCHEDULE A2:L{lastRow}
+  // ✅ NEW (v6) — record every tenure override that actually resulted in a
+  // schedule. Stamped only for rows in ledgerUpdates, so a row approved in the
+  // dialog but then dropped for some other reason is never marked as overridden.
+  // Both columns are opt_(): an older ledger without them loses the audit trail
+  // rather than losing the ability to schedule at all.
+  const ovrByIdx0 = opt_(ledMap, ADV_ELIG_OVERRIDE_BY_HEADER);
+  const ovrOnIdx0 = opt_(ledMap, ADV_ELIG_OVERRIDE_ON_HEADER);
+  const overrideBy = str_(requestedBy) || Session.getEffectiveUser().getEmail();
+
+  let overridesStamped = 0;
+  if (ovrByIdx0 !== -1 && ovrOnIdx0 !== -1) {
+    ledgerUpdates.forEach(u => {
+      if (!tenureOverrideRows.has(u.i)) return;
+      ledger.getRange(u.r, ovrByIdx0 + 1).setValue(overrideBy);
+      ledger.getRange(u.r, ovrOnIdx0 + 1).setValue(nowStamp);
+      overridesStamped++;
+    });
+  }
+
+  // ✅ Recreate single bulk protection on Advance Ledger A2:N{lastRow}
   refreshEmiScheduleProtection_(schedule, ss);
+
+  const overrideNote = overridesStamped > 0
+    ? `\n\n⚠️ ${overridesStamped} advance(s) scheduled under a 1-year-service ` +
+      `override, recorded against ${overrideBy}.`
+    : "";
 
   return {
     success:     true,
-    message:     `EMI Schedule created ✅\nReferences created: ${ledgerUpdates.length}\nEMI rows added: ${scheduleRows.length}` + skippedNote,
+    message:     `EMI Schedule created ✅\nReferences created: ${ledgerUpdates.length}\nEMI rows added: ${scheduleRows.length}` + overrideNote + skippedNote,
     refsCreated: ledgerUpdates.length,
     rowsAdded:   scheduleRows.length,
+    skippedIneligible: skippedAmount.length + skippedTenure.length,
   };
 }
 
@@ -832,8 +1017,13 @@ function refreshEmiScheduleProtection_(scheduleSheet, ss) {
     if (p.getDescription() === EMI_SCHEDULE_PROTECTION_DESC) p.remove();
   });
 
-  // ✅ Create one new protection: A2:L{lastRow} on Advance Ledger (data rows only)
-  const protectRange = ledger.getRange(2, 1, lastRow - 1, 12); // columns A(1) to L(12)
+  // ✅ Create one new protection: A2:N{lastRow} on Advance Ledger (data rows only)
+  // WIDENED 12 → 14 (v6). This span was A:L back when L was "EMI Start Month".
+  // Inserting "Eligible Amount" / "Eligibility Status" at I pushed that column
+  // to N, so 12 would now stop two columns short and leave Advance Amount,
+  // Tenure, Advance Paid Month and EMI Start Month partly unprotected. This is
+  // a COUNT, not a live formula reference — nothing auto-adjusts it.
+  const protectRange = ledger.getRange(2, 1, lastRow - 1, 14); // columns A(1) to N(14)
   const protection   = protectRange.protect();
 
   protection.setDescription(EMI_SCHEDULE_PROTECTION_DESC);

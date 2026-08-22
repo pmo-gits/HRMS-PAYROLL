@@ -43,6 +43,11 @@ function addEmpMasterSyncMenu_() {
   SpreadsheetApp.getUi()
     .createMenu("Master")
     .addItem("Refresh Employee Master (EMP master)", "syncEmpMaster_FromEmployeeMaster")
+    // ✅ NEW (v6) — added to THIS menu rather than a second createMenu("Master")
+    // elsewhere, which would render two separate menus with the same name.
+    // Handler lives in 4_SalaryMasterSync.gs; all files in this project share
+    // one global scope, so no import or re-declaration is needed.
+    .addItem("Refresh Salary Master (SALARY master)", "syncSalaryMaster_FromRevisionHistory")
     .addToUi();
 }
 
@@ -65,7 +70,11 @@ function syncEmpMaster_FromEmployeeMaster() {
   const ss   = SpreadsheetApp.getActiveSpreadsheet();
   const user = Session.getEffectiveUser().getEmail().toLowerCase();
 
-  if (user !== EMI_PMO_USER_ && user !== EMI_ALLOWED_USER_) {
+  // hrassist@ added alongside nazneen@: this only re-reads Employee Master into
+  // the local mirror — it moves no money and changes no limit. The matching
+  // server-side permission lives in EMI_ACTION_ALLOWED_ in 0_WebApp.gs; this
+  // check is convenience only, that one is the gate.
+  if (user !== EMI_PMO_USER_ && user !== EMI_ALLOWED_USER_ && user !== EMI_HR_ASSIST_USER_) {
     ui.alert("Access Denied", "You are not authorised to run this action.", ui.ButtonSet.OK);
     return;
   }
