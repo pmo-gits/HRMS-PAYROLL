@@ -86,6 +86,10 @@ function ledgerComputed() {
 }
 
 const GS_FILES = [
+  // Declares withEmiLock_, the shared module lock every Core now runs under.
+  // Loaded as the real file rather than stubbed: the lock is part of the
+  // behaviour under test, not scaffolding around it.
+  'salary-advance-master/0_WebApp.gs',
   'salary-advance-master/1_Advance_EMIScheduler.gs',
   // Loaded because files 5 and 6 call findLastDataRowByColumn_ / ensureTargetHasRows_,
   // which are declared HERE. In Apps Script every file in a project shares one
@@ -130,7 +134,18 @@ function makeWorld(requests) {
     envDefineId_: (name, key, fallback) => { sandbox[name] = fallback; },
     DriveApp: forbidden('DriveApp'),
     UrlFetchApp: forbidden('UrlFetchApp'),
-    LockService: forbidden('LockService'),
+    // A real, working single-holder lock rather than a no-op: an accidental
+    // nested acquire (a locked Core calling another locked Core) must surface
+    // here as a failure, exactly as it would deadlock in Apps Script.
+    LockService: (() => {
+      let held = false;
+      return {
+        getScriptLock: () => ({
+          tryLock: () => { if (held) return false; held = true; return true; },
+          releaseLock: () => { held = false; },
+        }),
+      };
+    })(),
     console, Date, Math, JSON, Map, Set, Array, Object, String, Number, Boolean,
     RegExp, Error, isNaN, isFinite, parseFloat, parseInt,
   };

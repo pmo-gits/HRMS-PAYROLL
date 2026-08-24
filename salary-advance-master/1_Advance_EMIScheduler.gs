@@ -413,6 +413,15 @@ function cancelEMI_ByReference() {
  * Returns: { success, message, refsCreated, rowsAdded, skippedIneligible }
  */
 function scheduleEMI_Core_(ss, allowExceptions, allowTenureExceptions, requestedBy) {
+  // ✅ NEW (v6) — serialised against the other advance operations. The race this
+  // closes: syncSalaryMaster_Core_ clears SALARY master before rewriting it, and
+  // a read landing in that window would find no salaries and refuse EVERY
+  // advance in this run as "no salary on record". See withEmiLock_ in 0_WebApp.gs.
+  return withEmiLock_("Schedule EMI", () =>
+    scheduleEMI_CoreLocked_(ss, allowExceptions, allowTenureExceptions, requestedBy));
+}
+
+function scheduleEMI_CoreLocked_(ss, allowExceptions, allowTenureExceptions, requestedBy) {
 
   const ledger   = ss.getSheetByName(ADV_LEDGER_SHEET);
   const schedule = ss.getSheetByName(EMI_SCHEDULE_SHEET);

@@ -287,6 +287,16 @@ function removeRequestRows_Validate_(ss, rowNumbers) {
  * Returns { success, message, removed }
  */
 function removeRequestRows_Core_(ss, rowNumbers, requestedBy) {
+  // ✅ Serialised, and this is the case where it genuinely matters. Validation
+  // resolves the selection to row NUMBERS, then deletion acts on them. A second
+  // removal landing in between shifts every row below it up by one, so those
+  // numbers now point somewhere else and the WRONG request is deleted —
+  // irreversibly, with the log recording the row that was meant to go.
+  return withEmiLock_("Remove Request Rows", () =>
+    removeRequestRows_CoreLocked_(ss, rowNumbers, requestedBy));
+}
+
+function removeRequestRows_CoreLocked_(ss, rowNumbers, requestedBy) {
   const ledger = ss.getSheetByName(ADV_LEDGER_SHEET);
   if (!ledger) throw new Error(`Sheet not found: ${ADV_LEDGER_SHEET}`);
 

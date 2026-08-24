@@ -43,11 +43,21 @@ function addEmpMasterSyncMenu_() {
   SpreadsheetApp.getUi()
     .createMenu("Master")
     .addItem("Refresh Employee Master (EMP master)", "syncEmpMaster_FromEmployeeMaster")
-    // ✅ NEW (v6) — added to THIS menu rather than a second createMenu("Master")
-    // elsewhere, which would render two separate menus with the same name.
-    // Handler lives in 4_SalaryMasterSync.gs; all files in this project share
-    // one global scope, so no import or re-declaration is needed.
-    .addItem("Refresh Salary Master (SALARY master)", "syncSalaryMaster_FromRevisionHistory")
+    // ✅ Handler lives in 7_SalaryMasterWatcher.gs. Rebuilds SALARY master only
+    // if Salary Revision History actually changed since the last check, and
+    // reports either way — the same check the hourly trigger runs on its own.
+    //
+    // "Refresh Salary Master" (syncSalaryMaster_FromRevisionHistory, in
+    // 4_SalaryMasterSync.gs) is DELIBERATELY NOT on this menu — an unconditional
+    // rebuild button sitting next to a conditional one confused users, since both
+    // produce the same visible result whenever there IS a change. The function
+    // itself is untouched and still callable from the Apps Script editor's Run
+    // dropdown (it doesn't end in "_") — kept as an escape hatch: any genuine
+    // salary change WILL be caught by the hash check above, but a forced rebuild
+    // can still be run by hand if the watcher itself needs debugging, or if
+    // someone simply wants SALARY master rewritten regardless of whether
+    // anything tracked has changed.
+    .addItem("Check Salary Revisions Now", "checkSalaryRevisionsNow")
     .addToUi();
 }
 

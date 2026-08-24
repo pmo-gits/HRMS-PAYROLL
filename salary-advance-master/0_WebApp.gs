@@ -271,6 +271,52 @@ function removeRequestRowsServer_(payload) {
  * Shared Utilities
  * ================================================ */
 
+/** How long a caller waits for the module lock before giving up. */
+const EMI_LOCK_TIMEOUT_MS_ = 30000;
+
+/**
+ * withEmiLock_(label, fn)
+ *
+ * Runs fn under ONE script-wide lock shared by every operation in this module
+ * that reads or writes the advance tables. A single lock rather than one per
+ * function, deliberately — the races that matter are BETWEEN different
+ * operations, not between two runs of the same one:
+ *
+ *   - syncSalaryMaster_Core_ clears SALARY master!A2:N and rewrites it. A
+ *     scheduleEMI_Core_ reading during that window sees no salaries and refuses
+ *     every advance as "no salary on record" — a wrong refusal caused purely by
+ *     timing, and a baffling one to debug after the fact.
+ *
+ *   - removeRequestRows_Core_ resolves its target rows, then deletes them. A
+ *     second removal landing in between shifts the sheet underneath those
+ *     numbers, and the WRONG row is deleted. This is the destructive one.
+ *
+ * NOT REENTRANT — never call a locked Core from inside another locked Core.
+ * The watcher in 7_SalaryMasterWatcher.gs therefore takes no lock of its own;
+ * it delegates to syncSalaryMaster_Core_, which takes it.
+ *
+ * FAILS CLOSED: if the lock cannot be acquired it throws rather than proceeding
+ * on data that may be mid-rewrite. Callers surface the message and the person
+ * runs it again — the alternative is a silent wrong answer.
+ */
+function withEmiLock_(label, fn) {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(EMI_LOCK_TIMEOUT_MS_)) {
+    throw new Error(
+      `${label} could not start: another salary-advance action is running ` +
+      `(waited ${Math.round(EMI_LOCK_TIMEOUT_MS_ / 1000)}s). Nothing was changed — ` +
+      `wait for it to finish and run this again.`
+    );
+  }
+
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 /**
  * emiJsonResponse_
  * Builds a JSON ContentService response.

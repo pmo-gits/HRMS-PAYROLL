@@ -131,6 +131,14 @@ function syncSalaryMaster_FromRevisionHistory() {
  * Returns { success, message, written, duplicates }
  */
 function syncSalaryMaster_Core_(ss) {
+  // ✅ Serialised: this function CLEARS SALARY master!A2:N before rewriting it,
+  // so anything reading the tab mid-run would see an empty salary table. The
+  // lock is taken here rather than in each caller, so the menu, the Web App and
+  // the hash watcher are all covered by the one guard. See withEmiLock_.
+  return withEmiLock_("Refresh Salary Master", () => syncSalaryMaster_CoreLocked_(ss));
+}
+
+function syncSalaryMaster_CoreLocked_(ss) {
   const target = ss.getSheetByName(SALARY_MASTER_SHEET_NAME);
   if (!target) throw new Error(`Sheet not found: ${SALARY_MASTER_SHEET_NAME}`);
 
