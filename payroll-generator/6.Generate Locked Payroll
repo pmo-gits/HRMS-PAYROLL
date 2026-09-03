@@ -147,6 +147,18 @@ function generateLockedPayrollServer_(payload) {
   let createdLockedFile = null;
   let ss, ui;
 
+  // Hoisted out of the try block so the catch can actually reach them. All three
+  // rollback helpers below have existed since this file was written but were never
+  // callable from the catch, because the payloads were declared with `const` inside
+  // the try and are block-scoped to it.
+  let salaryAdvanceSh = null;
+  let preparedAttendanceUpdate = null;
+  let preparedPayrollControlUpdate = null;
+  let preparedMetaUpdate = null;
+  let attendanceUpdateApplied = false;
+  let payrollControlApplied = false;
+  let metaApplied = false;
+
   try {
     ss = SpreadsheetApp.openById(spreadsheetId);
 
@@ -232,7 +244,7 @@ function generateLockedPayrollServer_(payload) {
 
     const attendanceSS = SpreadsheetApp.openById(attendanceFileId);
     const attendanceEntrySh = attendanceSS.getSheetByName(CONST.TABS.ATTENDANCE_ENTRY);
-    const salaryAdvanceSh = attendanceSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
+    salaryAdvanceSh = attendanceSS.getSheetByName(CONST.TABS.SALARY_ADVANCE_DEDUCTIONS);
 
     if (!attendanceEntrySh) {
       return { success: false, message: `Attendance tab not found: ${CONST.TABS.ATTENDANCE_ENTRY}` };
@@ -264,8 +276,8 @@ function generateLockedPayrollServer_(payload) {
       return { success: false, message: err.message };
     }
 
-    const preparedAttendanceUpdate = glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, approvalSh, nowText);
-    const preparedPayrollControlUpdate = glpPreparePayrollControlCenterUpdatePayload_({
+    preparedAttendanceUpdate = glpPrepareSalaryAdvanceUpdatePayload_(payrollSh, salaryAdvanceSh, approvalSh, nowText);
+    preparedPayrollControlUpdate = glpPreparePayrollControlCenterUpdatePayload_({
       monthLabel: monthLabel,
       attendanceFileId: attendanceFileId,
       lockedFileName: lockedFileName,
@@ -273,7 +285,7 @@ function generateLockedPayrollServer_(payload) {
       lockedOn: nowText,
       lockedBy: userEmail,
     });
-    const preparedMetaUpdate = glpPrepareMetaUpdatePayload_(meta);
+    preparedMetaUpdate = glpPrepareMetaUpdatePayload_(meta);
 
     const lockedFolder = DriveApp.getFolderById(CONST.FOLDERS.LOCKED_PAYROLL_FILES);
 
@@ -306,6 +318,7 @@ function generateLockedPayrollServer_(payload) {
 
     try {
       glpApplySalaryAdvanceUpdatePayload_(salaryAdvanceSh, preparedAttendanceUpdate);
+      attendanceUpdateApplied = true;
       SpreadsheetApp.flush();
 
       glpPushRecoveredLedgerSnapshot_(attendanceSS, ss);
@@ -314,15 +327,34 @@ function generateLockedPayrollServer_(payload) {
 
     } catch (salaryAdvanceWriteErr) {
       try { glpRollbackSalaryAdvanceUpdatePayload_(salaryAdvanceSh, preparedAttendanceUpdate); } catch (_) {}
+      // Cleared so the outer catch does not restore a second time on the way past.
+      attendanceUpdateApplied = false;
       SpreadsheetApp.flush();
       throw salaryAdvanceWriteErr;
     }
+
+    // ── WRITE EVERYTHING FIRST, PROTECT AFTERWARDS ──
+    //
+    // These two writes used to come AFTER the protections below, which made the
+    // script block its own META_DATA write — "You are trying to edit a protected
+    // cell or object". META_DATA lives in this very workings file, and the
+    // protection applied to it leaves a restricted editor list behind, so the
+    // write that follows has to happen while the file is still open.
+    //
+    // Nothing after this point writes to either file, so protecting last is safe.
+    glpApplyPayrollControlCenterUpdatePayload_(preparedPayrollControlUpdate);
+    payrollControlApplied = true;
+
+    glpApplyMetaUpdatePayload_(preparedMetaUpdate);
+    metaApplied = true;
+
+    SpreadsheetApp.flush();
 
     // ── PROTECTION: Attendance file (whole sheet, fast) ──
     glpProtectEntireSpreadsheet_(attendanceSS, {
       descriptionPrefix: `ATTENDANCE_LOCKED_${monthLabel}`,
       unprotectedRangesBySheetId: {},
-      editorsToKeep: [],
+      editorsToKeep: [CONST.LOCK_RULES.OWNER_EMAIL],
       preserveExistingEditors: false,
     });
 
@@ -339,19 +371,37 @@ function generateLockedPayrollServer_(payload) {
 
     SpreadsheetApp.flush();
 
-    glpApplyPayrollControlCenterUpdatePayload_(preparedPayrollControlUpdate);
-    glpApplyMetaUpdatePayload_(preparedMetaUpdate);
-    SpreadsheetApp.flush();
-
     return {
       success: true,
       message: `Locked payroll created successfully for ${monthLabel}.`,
     };
 
   } catch (err) {
+    // Compensating transaction, unwound in reverse order of application. Each step
+    // is guarded on its own so one failing undo cannot swallow the others, and each
+    // is gated on an "applied" flag so nothing is restored that was never written.
+    //
+    // Without this, a failure after the Control Center write left the month stranded:
+    // the Control Center row read LOCKED while META_DATA still read OPEN, and the
+    // next run failed on a different line for a different reason.
+    if (metaApplied && preparedMetaUpdate) {
+      try { glpRollbackMetaUpdatePayload_(preparedMetaUpdate); } catch (_) {}
+    }
+    if (payrollControlApplied && preparedPayrollControlUpdate) {
+      try { glpRollbackPayrollControlCenterUpdatePayload_(preparedPayrollControlUpdate); } catch (_) {}
+    }
+    // The attendance write is step 1, so it unwinds last. Without this the file kept
+    // Payroll Status = LOCKED after a failed run, and the next attempt was refused by
+    // glpAssertSalaryAdvancePayrollNotLocked_ — "Duplicate payroll lock blocked" —
+    // with no way forward except clearing the column by hand.
+    if (attendanceUpdateApplied && salaryAdvanceSh && preparedAttendanceUpdate) {
+      try { glpRollbackSalaryAdvanceUpdatePayload_(salaryAdvanceSh, preparedAttendanceUpdate); } catch (_) {}
+    }
     if (createdLockedFile) {
       try { createdLockedFile.setTrashed(true); } catch (_) {}
     }
+    try { SpreadsheetApp.flush(); } catch (_) {}
+
     return {
       success: false,
       message: `Error: ${err && err.message ? err.message : err}`,
@@ -1244,7 +1294,10 @@ function glpProtectPayrollControlCenterCells_(ccSh, row, headerNames, monthLabel
     protection.setDescription(`PAYROLL_CONTROL_LOCK_${monthLabel || 'ROW'}__${header}`);
     protection.setWarningOnly(false);
 
-    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    // pmo@ stays on the list, so a rollback (or a later re-run of the month) can
+    // still write these cells back. Without it the first failed attempt made the
+    // Control Center row permanently unwritable by the script.
+    glpRestrictProtectionToOwner_(protection, [CONST.LOCK_RULES.OWNER_EMAIL]);
     try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
   }
 }
@@ -1253,6 +1306,40 @@ function glpProtectPayrollControlCenterCells_(ccSh, row, headerNames, monthLabel
    PROTECTIONS
    — UNCHANGED —
 ========================================================= */
+
+/**
+ * Strip a protection's editors down to `keepEmails`, then guarantee those emails
+ * are on it. Replaces the bare `removeEditors(getEditors())` that used to appear in
+ * the three helpers below, for two reasons:
+ *
+ * 1. It left NOBODY able to edit. Every other protection helper in this system —
+ *    gpdProtectPayrollTab_, vpProtectFixedSalaryCheckTab_, usaLockApprovalTab_,
+ *    refreshControlSheetProtection_, refreshEmiScheduleProtection_ — removes all
+ *    editors and then adds pmo@ straight back. These three did not, so the script,
+ *    which runs as pmo@ on both the direct and the Web App path, locked itself out
+ *    of the files it still had to write to.
+ *
+ * 2. Handing the owner to removeEditors() makes Apps Script silently abort the whole
+ *    call and leave the protection unsaved — documented in this codebase in
+ *    refreshEmiScheduleProtection_ and refreshControlSheetProtection_, both of which
+ *    filter the owner out first. The old code wrapped the call in a bare try/catch,
+ *    so that failure was invisible.
+ */
+function glpRestrictProtectionToOwner_(protection, keepEmails) {
+  const keep = (keepEmails || [])
+    .map(e => String(e || '').trim().toLowerCase())
+    .filter(e => e);
+
+  try {
+    const editorsToRemove = protection.getEditors()
+      .filter(e => keep.indexOf(String((e && e.getEmail && e.getEmail()) || '').trim().toLowerCase()) === -1);
+    if (editorsToRemove.length) protection.removeEditors(editorsToRemove);
+  } catch (_) {}
+
+  if (keep.length) {
+    try { protection.addEditors(keep); } catch (_) {}
+  }
+}
 
 function glpProtectEntireSpreadsheet_(ss, options) {
   const sheets = ss.getSheets();
@@ -1274,10 +1361,7 @@ function glpProtectEntireSpreadsheet_(ss, options) {
     }
 
     if (!preserveExistingEditors) {
-      try { protection.removeEditors(protection.getEditors()); } catch (_) {}
-      if (editorsToKeep.length) {
-        try { protection.addEditors(editorsToKeep); } catch (_) {}
-      }
+      glpRestrictProtectionToOwner_(protection, editorsToKeep);
     } else if (editorsToKeep.length) {
       try { protection.addEditors(editorsToKeep); } catch (_) {}
     }
@@ -1309,7 +1393,7 @@ function glpProtectWorkingsFileExceptReleaseAndBankMarkDownColumns_(
       protection.setUnprotectedRanges([releaseRange, bankMarkDownRange]);
     }
 
-    try { protection.removeEditors(protection.getEditors()); } catch (_) {}
+    glpRestrictProtectionToOwner_(protection, [CONST.LOCK_RULES.OWNER_EMAIL]);
     try { if (protection.canDomainEdit()) protection.setDomainEdit(false); } catch (_) {}
   }
 }
