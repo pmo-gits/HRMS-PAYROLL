@@ -10,7 +10,7 @@ The core 9-stage payroll pipeline, `PAYROLL_GEN_1` through `PAYROLL_GEN_10`. Thi
 | `4.VALIDATE ATTENDANCE` | `validateAttendance()` / `validateAttendanceServer_()` | Gate before anything else runs. Locates `Attendance_<Month>_<Year>`, checks lock flags, validates every tab (headers, blanks, numeric sanity), writes META keys `PAYROLL_MONTH_LABEL`, `ATTENDANCE_FILE_ID`, `ATTENDANCE_LAST_UPDATED`, `ATTENDANCE_VALIDATION`. |
 | `2.GET PAYROLL DATA` | `getPayrollData()` / `getPayrollDataServer_()` | Re-checks the same META gates plus staleness (Drive `lastUpdated` vs stored), plus a hard-stop precheck for duplicate Aadhaar No across the run's employees (`gpdFindDuplicateAadhaar_`, step 7B) before any `PAY_ROLL` write. Pulls Attendance tabs + Employee Master (incl. Aadhaar No) + Salary Revision History + Petrol Conveyance History into `PAY_ROLL` per `CONST.MAP`. Protects the tab except "Payroll Release Confirmation" / "Bank Transfer Mark Down". |
 | `5.Validate Payroll` | `validatePayroll()` / `validatePayrollServer_()` | Cross-checks fixed-salary revision data into `FIXED_SALARY_CHECK` for reconciliation. Informational — does not feed back into `PAY_ROLL`. Fully protects the tab afterward. |
-| `6.Generate Locked Payroll` | `generateLockedPayroll()` / `generateLockedPayrollServer_()` | **The point of no return.** All-or-nothing lock: prechecks, snapshots the whole spreadsheet to a values-only locked copy, pushes ledger snapshots (files 8 & 9), protects attendance + workings files, updates Payroll Control Center. Also hosts the module's single `doPost(e)` web-app dispatcher for all stages. |
+| `6.Generate Locked Payroll` | `generateLockedPayroll()` / `generateLockedPayrollServer_()` | **The point of no return.** All-or-nothing lock: prechecks, snapshots the whole spreadsheet to a values-only locked copy, pushes ledger snapshots (files 8 & 9), updates Payroll Control Center and `META_DATA`, **then** protects the attendance + workings files. Protecting last is deliberate — see the self-lockout note below. Also hosts the module's single `doPost(e)` web-app dispatcher for all stages. |
 | `8.RecoveredLedgerPush` | `glpPushRecoveredLedgerSnapshot_()` | Called from file 6's lock flow — appends locked Salary Advance deduction rows into [salary-advance-master/](../salary-advance-master/CLAUDE.md)'s Recovered Amount Ledger. |
 | `9.LeaveLedgerPush.gs` | `glpPushLeaveLedgerSnapshotAndUpdateBalances_()` | Called from file 6's lock flow — appends an Approved Leave Ledger snapshot, updates EL/CL/SL balances in [leave-master/](../leave-master/CLAUDE.md) (STAFF only), with Dec year-end reset and Mar carry-forward expiry rules. |
 | `7.Generate Bank Transfer File` | `generateBankTransferFile()` / `generateBankTransferFileServer_()` | Runs only after `LOCK_STATUS = LOCKED`. Splits eligible employees into `UNION_BANK` vs `OTHER_BANKS` by IFSC, stamps a "Bank Transfer Mark Down" timestamp. |
@@ -35,7 +35,54 @@ All server functions route through file 6's single `doPost(e)`, keyed by `payloa
 ## Non-obvious patterns
 
 - **Header-name-based lookups everywhere**, but `buildHeaderIndex_`/`norm_` is **reimplemented per file** (`btfBuildHeaderIndex_`, `psgBuildHeaderIndex_`, `buildHeaderIndexMap_`) with slightly different signatures (Map vs plain object) rather than shared. If fixing a header-lookup bug, check whether it's duplicated elsewhere before assuming one fix covers all stages.
-- **All-or-nothing locking pattern with manual rollback** (file 6): wrapped in `LockService.getScriptLock()` + try/catch/finally. Explicit compensating-transaction helpers (`glpRollbackSalaryAdvanceUpdatePayload_`, `glpRollbackMetaUpdatePayload_`, trashing the newly created locked file) run if any step after the Drive copy fails — Apps Script has no real cross-service transactions, this is the manual substitute.
+- **All-or-nothing locking pattern with manual rollback** (file 6): wrapped in
+  `LockService.getScriptLock()` + try/catch/finally. Three compensating-transaction helpers —
+  `glpRollbackMetaUpdatePayload_`, `glpRollbackPayrollControlCenterUpdatePayload_`,
+  `glpRollbackSalaryAdvanceUpdatePayload_` — unwind in reverse order of application, each gated
+  on its own `…Applied` flag and individually try/caught, plus the newly created locked file is
+  trashed. Apps Script has no real cross-service transactions; this is the manual substitute.
+  - ⚠️ **Until 2026-09 none of them could actually run.** All three payloads were declared with
+    `const` *inside* the `try`, so they were block-scoped and invisible to the `catch`. The
+    helpers existed and were correct — they were simply unreachable. They are now `let` at
+    function scope and assigned inside the try. If you add a fourth rollback, declare it the
+    same way or it will be dead on arrival in exactly the same manner.
+  - **Two writes are still NOT unwound**, by nature rather than by omission:
+    `glpPushRecoveredLedgerSnapshot_` and `glpPushLeaveLedgerSnapshotAndUpdateBalances_` push
+    into Salary Advance Master and Leave Master, and there is no safe undo for either.
+  - **`Planned EMI`'s ARRAYFORMULA is not restored** by the attendance rollback — only its
+    values are. The code comment claims Validate Payroll rebuilds it; **it does not**, and
+    nothing else does either (`grep setFormula attendance/` returns nothing, and
+    `13_SalaryAdvance.gs` states three times that it does not touch that column). So after any
+    failed lock that column is permanently static. Known and accepted, not fixed.
+
+- **File 6 used to lock itself out of the files it still had to write to (fixed 2026-09).** The
+  two protection calls ran *before* the Control Center and `META_DATA` writes, and — unlike the
+  five other protection helpers in this system (`gpdProtectPayrollTab_`,
+  `vpProtectFixedSalaryCheckTab_`, `usaLockApprovalTab_`, `refreshControlSheetProtection_`,
+  `refreshEmiScheduleProtection_`, all of which re-add the owner) — file 6's helpers called
+  `removeEditors(getEditors())` and added **nobody** back. `META_DATA` lives in the very workings
+  file just protected, so the next write threw *"You are trying to edit a protected cell or
+  object"*, on both the direct and the Web App path (both execute as pmo@).
+  - **Why it never surfaced in the sandbox:** a Sheets protection cannot lock out a file's
+    *owner*, and test files sit in pmo@'s My Drive. Production files are on a **Shared Drive**,
+    which has no owner and therefore no owner immunity — so the identical code fails there and
+    only there. The `_tests/` harness cannot catch this class of bug either: `sheets.js` models
+    no protections at all, by design.
+  - Fixed two ways over: the writes now happen **before** the protections, and
+    `glpRestrictProtectionToOwner_` filters the owner out of `removeEditors` (handing the owner
+    to it silently aborts the whole call — documented in `refreshEmiScheduleProtection_`) and
+    then `addEditors` them back.
+  - **Not fixed, deliberately:** file 6 still never removes its *previous* protections before
+    calling `.protect()`, so a failed run followed by a retry stacks duplicates on the same
+    file. Harmless now that every protection retains pmo@, and each month uses a fresh file, so
+    nothing accumulates month to month. If it is ever added it must be scoped to file 6's own
+    descriptions (`ATTENDANCE_LOCKED_`, `PAYROLL_WORKINGS_LOCK_`, `PAYROLL_CONTROL_LOCK_`) — a
+    blanket removal would also delete `AUTO_SETTLEMENT_PROTECT_*` and any hand-made protection.
+  - **`attendance/13_SalaryAdvance.gs`'s `protectSettlementRange_` has the same zero-editor
+    bug** and is *not* fixed. It only covers `Settlement Stage` / `Last Working Day`, which file
+    6 never writes, so it cannot block the lock — but it does mean nobody can hand-edit those
+    columns between runs. It is self-healing only because it removes its own
+    `SETTLEMENT_PROTECTION_PREFIX` protections first, which is the pattern file 6 lacks.
 - **`normalizeNumberIfPossible_()` must never run on identifier columns.** File 2 defines `TEXT_PRESERVE_HEADERS` (Bank Account No, UAN No, ESI No, IFSC Code, Aadhaar No), force-set to Plain Text (`setNumberFormat('@')`) before writing. File 7 reapplies the same `'@'` format on Employee Code/Bank Account No/IFSC in the bank transfer output.
 - **Duplicate Aadhaar precheck runs before any `PAY_ROLL` write.** File 2's `gpdFindDuplicateAadhaar_` (step 7B) reads Aadhaar No from Employee Master for every employee in the run, groups by normalized value (whitespace stripped), and hard-stops with no writes if any Aadhaar No is shared by more than one employee code — catches Employee Master data-entry errors before they'd otherwise silently merge/misattribute pay records. Blank Aadhaar No is skipped, not flagged, as a defensive fallback (not a validation rule). Aadhaar No itself is then written into `PAY_ROLL` only as a display/reference column via the `CONST.MAP` entry above — no other stage (Validate Payroll, Bank Transfer, Payslips) currently reads or surfaces it. **Note:** this precheck was drafted in chat before it was actually added to the file — added to `2.GET PAYROLL DATA` for real on 2026-07-21 (previously the file had only the `CONST.MAP` entry, which was the source of a `gpdFindDuplicateAadhaar_ is not defined` runtime error until this was fixed).
 - **Timestamp-as-text pattern**: `setMetaValueAsText_` (file 4) writes `ATTENDANCE_LAST_UPDATED` with number format `'@STRING@'` so Sheets can't reinterpret it as a date/time and strip a leading zero — Get Payroll Data does a strict string comparison against Drive's `getLastUpdated()`, so any reformatting here breaks that gate silently.
